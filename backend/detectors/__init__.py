@@ -137,10 +137,11 @@ def detect_godot(root: Path) -> dict | None:
 def detect_container(root: Path) -> dict | None:
     """APK/OBB（安卓 Unity 容器）：解包/直读内部 bundle，复用 Unity 管线。"""
     from .container import find_containers, prepare_containers
+    from ..paths import CACHE_DIR
     containers = find_containers(root)
     if not containers:
         return None
-    cache_root = Path(__file__).resolve().parent.parent.parent / ".cache" / "containers"
+    cache_root = CACHE_DIR / "containers"
     prep = prepare_containers(containers, cache_root)
     if not prep["asset_files"]:
         return None

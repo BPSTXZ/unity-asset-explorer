@@ -23,11 +23,10 @@ from .detectors import detect
 from .parsers.unity_parser import ScanJob
 from .exporters.gltf import mesh_to_glb, animation_to_glb, animation_info, humanoid_export
 from .exporters.character import character_to_glb, mesh_to_glb_textured, character_bone_crc
+from .paths import CACHE_DIR, EXPORT_DIR, FRONTEND_DIR
 
-ROOT = Path(__file__).resolve().parent.parent
-CACHE_DIR = ROOT / ".cache"
-CACHE_DIR.mkdir(exist_ok=True)
-DEFAULT_EXPORT_DIR = ROOT / "exports"
+CACHE_DIR.mkdir(exist_ok=True, parents=True)
+DEFAULT_EXPORT_DIR = EXPORT_DIR
 
 app = FastAPI(title="Asset Explorer")
 
@@ -880,4 +879,4 @@ def api_open_folder(req: PathReq):
     return {"ok": True}
 
 
-app.mount("/", StaticFiles(directory=str(ROOT / "frontend"), html=True), name="frontend")
+app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

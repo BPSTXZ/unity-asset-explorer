@@ -9,6 +9,10 @@ __pycache__/
 .cache/
 exports/
 
+# PyInstaller 构建产物
+build/
+dist/
+
 # 编辑器 / 系统
 .vscode/
 .idea/
