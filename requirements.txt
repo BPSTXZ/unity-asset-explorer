@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+UnityPy>=1.25
+Pillow
+python-multipart

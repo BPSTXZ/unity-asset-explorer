@@ -1,0 +1,20 @@
+# Python 环境 / 缓存
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 运行时生成物（预览缓存、会话、收藏、导出）
+.cache/
+exports/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log

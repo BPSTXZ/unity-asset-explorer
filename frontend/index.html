@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Asset Explorer · 游戏资源提取</title>
+<link rel="stylesheet" href="/style.css?v=6">
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three.module.js",
+    "three/addons/": "/vendor/addons/"
+  }
+}
+</script>
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">Asset<span>Explorer</span></div>
+  <div class="pathbox">
+    <input id="pathInput" type="text" placeholder="游戏目录 / 资源文件路径" spellcheck="false">
+    <button id="btnBrowse" class="btn icon" title="选择文件夹">📁</button>
+  </div>
+  <button id="btnDetect" class="btn">识别引擎</button>
+  <button id="btnScan" class="btn primary" disabled>扫描资源</button>
+  <button id="btnExample" class="btn ghost" title="载入参考示例游戏">示例</button>
+  <div id="engineBadge" class="badge hidden"></div>
+  <div id="scanProgress" class="progress hidden"><div class="bar"></div><span class="label"></span></div>
+</header>
+
+<main id="layout">
+  <aside id="sidebar">
+    <div id="projName" class="proj hidden"></div>
+    <div class="side-title toggle" id="typeTitle"><span class="chev">▾</span>资源类型</div>
+    <ul id="typeList"><li class="empty">尚未扫描</li></ul>
+    <div class="side-title toggle fav-title collapsed" id="favTitle"><span class="chev">▾</span>我的收藏<span id="favCount" class="fav-count"></span></div>
+    <ul id="favList" class="hidden"><li class="empty">暂无收藏</li></ul>
+    <div class="side-title">导出</div>
+    <button id="btnExportSelected" class="btn primary wide" disabled>导出选中 (0)</button>
+    <button id="btnExportAll" class="btn wide" disabled>导出当前筛选</button>
+    <button id="btnOpenExports" class="btn wide">打开导出目录</button>
+  </aside>
+  <div class="divider" id="divLeft" title="拖动调节侧栏宽度"></div>
+
+  <section id="listPane">
+    <div id="listToolbar">
+      <input id="searchInput" type="text" placeholder="搜索名称 / 容器路径…">
+      <span id="listCount"></span>
+      <div class="pager">
+        <button id="btnPrev" class="btn small">‹</button>
+        <span id="pageLabel">0 / 0</span>
+        <button id="btnNext" class="btn small">›</button>
+      </div>
+    </div>
+    <div id="assetTableWrap">
+      <table id="assetTable">
+        <thead><tr>
+          <th class="col-check"><input type="checkbox" id="checkAll"></th>
+          <th class="col-fav" title="收藏"></th>
+          <th class="sortable" id="thName" title="点击排序">名称<span class="arrow"></span></th>
+          <th>类型</th><th>来源文件</th>
+          <th class="sortable" id="thSize" title="点击排序">大小<span class="arrow"></span></th>
+          <th>附加信息</th>
+        </tr></thead>
+        <tbody id="assetTbody"><tr><td colspan="7" class="empty">选择游戏目录 → 识别引擎 → 扫描资源</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+  <div class="divider" id="divRight" title="拖动调节预览区宽度"></div>
+
+  <section id="previewPane">
+    <div id="previewHeader">
+      <span id="previewTitle">预览</span>
+      <div id="previewActions"></div>
+    </div>
+    <div id="previewBody"><div class="placeholder">点击左侧资源进行预览</div></div>
+    <div id="animPanel" class="hidden">
+      <div class="anim-bar">
+        <button id="animClipBtn" class="btn small">选择动画 ▾</button>
+        <button id="animPlay" class="btn small" disabled>播放</button>
+        <input id="animSeek" type="range" min="0" max="1000" value="0" disabled>
+        <span id="animTime">--</span>
+        <button id="animExportFrame" class="btn small primary" disabled>导出当前帧</button>
+        <button id="animClose" class="btn small ghost">退出动画</button>
+      </div>
+      <div id="animDropdown" class="anim-dropdown hidden">
+        <input id="animSearch" type="text" placeholder="搜索动画名称…">
+        <div id="animScanState" class="anim-scan"></div>
+        <div id="animList" class="anim-list"></div>
+      </div>
+    </div>
+    <div id="previewMeta"></div>
+  </section>
+</main>
+
+<div id="folderDialog" class="dialog hidden">
+  <div class="dialog-box folder-box">
+    <h3>选择文件夹</h3>
+    <div class="folder-bar">
+      <button id="folderUp" class="btn small">↑ 上级</button>
+      <button id="folderDrives" class="btn small">此电脑</button>
+      <span id="folderPath" class="folder-path"></span>
+    </div>
+    <ul id="folderList" class="folder-list"></ul>
+    <div class="dialog-btns">
+      <button id="folderChoose" class="btn primary">选择此文件夹</button>
+      <button id="folderCancel" class="btn">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="exportDialog" class="dialog hidden">
+  <div class="dialog-box">
+    <h3>批量导出</h3>
+    <label>输出目录<input id="exportDir" type="text" placeholder="留空使用默认 exports\<游戏名>"></label>
+    <label class="row">模型格式
+      <span><input type="checkbox" id="fmtGlb" checked> GLB</span>
+      <span><input type="checkbox" id="fmtObj" checked> OBJ</span>
+    </label>
+    <div id="exportProgress" class="progress hidden"><div class="bar"></div><span class="label"></span></div>
+    <div id="exportErrors"></div>
+    <div class="dialog-btns">
+      <button id="btnExportStart" class="btn primary">开始导出</button>
+      <button id="btnExportClose" class="btn">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="favDialog" class="dialog hidden">
+  <div class="dialog-box">
+    <h3 id="favDialogTitle">收藏资源</h3>
+    <p class="fav-orig">原名：<b id="favOrigName"></b></p>
+    <label>收藏名称（仅个人辨识，不影响原命名与模型功能）
+      <input id="favAlias" type="text" maxlength="60" placeholder="输入自定义名称" spellcheck="false">
+    </label>
+    <div class="dialog-btns">
+      <button id="favConfirm" class="btn primary">收藏</button>
+      <button id="favCancel" class="btn">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+<script type="module" src="/app.js?v=19"></script>
+</body>
+</html>
