@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import string
 import threading
 from collections import OrderedDict
@@ -344,12 +345,31 @@ def api_project_remove():
         _env_cache.clear()
         _env_deps_cache.clear()
     _state.update(detect=None, scan=None, scan_path=None, assets=[], export=None)
+    gc.collect()  # 先释放 UnityPy 文件句柄，避免 Windows 下缓存文件被锁
+    _clear_disk_caches()
+    return {"removed": True}
+
+
+def _clear_disk_caches():
+    """删除可再生缓存：预览 PNG/GLB、缩略图、解包容器；保留收藏。"""
+    try:
+        for p in CACHE_DIR.glob("*.png"):
+            p.unlink(missing_ok=True)
+        for p in CACHE_DIR.glob("*.glb"):
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
+    shutil.rmtree(CACHE_DIR / "thumbs", ignore_errors=True)
+    (CACHE_DIR / "thumbs").mkdir(exist_ok=True)
+    containers = CACHE_DIR / "containers"
+    shutil.rmtree(containers, ignore_errors=True)
+    if containers.exists():  # 句柄延迟释放时重试
+        gc.collect()
+        shutil.rmtree(containers, ignore_errors=True)
     try:
         SESSION_FILE.unlink(missing_ok=True)
     except OSError:
         pass
-    gc.collect()
-    return {"removed": True}
 
 
 @app.get("/api/session")

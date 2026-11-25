@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Asset Explorer · 游戏资源提取</title>
-<link rel="stylesheet" href="/style.css?v=10">
+<link rel="stylesheet" href="/style.css?v=11">
 <script type="importmap">
 {
   "imports": {
@@ -33,7 +33,7 @@
   <aside id="sidebar">
     <div id="projRow" class="proj-row hidden">
       <div id="projName" class="proj"></div>
-      <button id="btnRemoveProject" class="btn small ghost" title="移除项目并释放内存">✕</button>
+      <button id="btnRemoveProject" class="proj-remove" title="移除项目并清理缓存">✕</button>
     </div>
     <div class="side-title toggle" id="typeTitle"><span class="chev">▾</span>资源类型</div>
     <ul id="typeList"><li class="empty">尚未扫描</li></ul>
@@ -182,6 +182,6 @@
 </div>
 
 <div id="toast" class="hidden"></div>
-<script type="module" src="/app.js?v=26"></script>
+<script type="module" src="/app.js?v=27"></script>
 </body>
 </html>

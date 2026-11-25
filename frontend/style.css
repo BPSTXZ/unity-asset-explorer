@@ -75,8 +75,15 @@ body {
 }
 .proj-row { display: flex; align-items: center; gap: 6px; }
 .proj-row .proj { flex: 1; min-width: 0; }
-#btnRemoveProject { flex: none; padding: 4px 8px; color: var(--dim); }
-#btnRemoveProject:hover { color: #ff7b72; border-color: #ff7b72; }
+.proj-remove {
+  flex: none; width: 26px; height: 26px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 6px; border: 1px solid transparent; background: transparent;
+  color: var(--dim); font-size: 13px; line-height: 1; cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.proj-remove:hover { color: #ff7b72; background: rgba(255,107,107,.12); border-color: rgba(255,107,107,.4); }
+.proj-remove:active { background: rgba(255,107,107,.22); }
 #typeList { list-style: none; }
 #typeList li {
   padding: 6px 8px; border-radius: 6px; cursor: pointer;

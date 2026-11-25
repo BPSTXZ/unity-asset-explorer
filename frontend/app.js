@@ -227,7 +227,7 @@ $('btnScanPause').onclick = async () => {
 };
 
 $('btnRemoveProject').onclick = async () => {
-  if (!confirm('移除当前项目？\n将停止扫描/导出、清空资源清单并释放内存（收藏保留）。')) return;
+  if (!confirm('移除当前项目？\n将停止扫描/导出、清空资源清单与缓存并释放内存（收藏保留）。')) return;
   try { await postJson('/api/project/remove', {}); }
   catch (e) { return toast(e.message, true); }
   resetProjectUI();
