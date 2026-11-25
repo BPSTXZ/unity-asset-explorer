@@ -49,18 +49,42 @@ def _extra_info(data, tname: str) -> dict:
 class ScanJob:
     def __init__(self, files: list[str]):
         self.files = files
-        self.state = "running"  # running | done | error
+        self.state = "running"  # running | paused | done | error
         self.done_files = 0
         self.assets: list[dict] = []
         self.type_counts: dict[str, int] = {}
         self.error: str | None = None
         self._lock = threading.Lock()
+        self._gate = threading.Event()  # set=运行，clear=暂停
+        self._gate.set()
+        self._cancelled = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def pause(self):
+        with self._lock:
+            if self.state == "running":
+                self.state = "paused"
+                self._gate.clear()
+
+    def resume(self):
+        with self._lock:
+            if self.state == "paused":
+                self.state = "running"
+                self._gate.set()
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            self.state = "cancelled"
+            self._gate.set()  # 解除暂停阻塞，让线程尽快退出
 
     def _run(self):
         try:
             for f in self.files:
+                self._gate.wait()
+                if self._cancelled:
+                    break
                 try:
                     env = UnityPy.load(f)
                 except Exception:
@@ -69,7 +93,11 @@ class ScanJob:
                     continue
                 fname = Path(f).name
                 has_smr = False
-                for reader in env.objects:
+                for n, reader in enumerate(env.objects):
+                    if n % 200 == 0:
+                        self._gate.wait()
+                        if self._cancelled:
+                            break
                     tname = reader.type.name
                     if tname == "SkinnedMeshRenderer":
                         has_smr = True
@@ -95,7 +123,8 @@ class ScanJob:
                             "extra": _extra_info(data, tname),
                         })
                         self.type_counts[tname] = self.type_counts.get(tname, 0) + 1
-                if has_smr:
+                if has_smr and not self._cancelled:
+                    self._gate.wait()
                     try:
                         for ch in find_characters(env):
                             with self._lock:
@@ -112,12 +141,16 @@ class ScanJob:
                         pass
                 # 释放本文件解析对象，仅保留元数据，控制内存
                 del env
+                if self._cancelled:
+                    break
                 with self._lock:
                     self.done_files += 1
-            self.state = "done"
+            if not self._cancelled:
+                self.state = "done"
         except Exception as e:
-            self.state = "error"
-            self.error = str(e)
+            if not self._cancelled:
+                self.state = "error"
+                self.error = str(e)
 
     def status(self) -> dict:
         with self._lock:

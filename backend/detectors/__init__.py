@@ -134,11 +134,41 @@ def detect_godot(root: Path) -> dict | None:
     }
 
 
+def detect_container(root: Path) -> dict | None:
+    """APK/OBB（安卓 Unity 容器）：解包/直读内部 bundle，复用 Unity 管线。"""
+    from .container import find_containers, prepare_containers
+    containers = find_containers(root)
+    if not containers:
+        return None
+    cache_root = Path(__file__).resolve().parent.parent.parent / ".cache" / "containers"
+    prep = prepare_containers(containers, cache_root)
+    if not prep["asset_files"]:
+        return None
+    return {
+        "engine": "unity",
+        "engine_label": "Unity · Android",
+        "confidence": "high",
+        "unity_version": prep["version"],
+        "scripting_backend": "IL2CPP",
+        "data_dir": str(cache_root),
+        "asset_files": prep["asset_files"],
+        "container_files": [str(c) for c in containers],
+        "notes": [f"Android 容器：{', '.join(prep['containers'])}"] + prep["notes"],
+    }
+
+
 def detect(path: str) -> dict:
     root = Path(path)
     if not root.exists():
         return {"engine": None, "error": f"路径不存在: {path}"}
     if root.is_file():
+        if root.suffix.lower() in (".apk", ".obb"):
+            r = detect_container(root)
+            if r:
+                r["root"] = str(root)
+                r["supported"] = True
+                return r
+            return {"engine": None, "error": "容器内未发现可解析的 Unity 资源"}
         if _is_unity_bundle(root) or root.suffix in (".assets", ".unity3d", ".bundle"):
             return {
                 "engine": "unity", "engine_label": "Unity", "confidence": "high",
@@ -150,7 +180,7 @@ def detect(path: str) -> dict:
                 "notes": ["单文件模式"],
             }
         return {"engine": None, "error": "无法识别该文件类型"}
-    for fn in (detect_unity, detect_unreal, detect_godot):
+    for fn in (detect_container, detect_unity, detect_unreal, detect_godot):
         r = fn(root)
         if r:
             r["root"] = str(root)

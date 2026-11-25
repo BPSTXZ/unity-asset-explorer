@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import gc
+import hashlib
 import json
 import os
 import re
@@ -221,7 +223,15 @@ class ExportReq(BaseModel):
     mesh_formats: list[str] = ["glb", "obj"]
 
 
-# ---------- 目录浏览（文件夹选择） ----------
+# ---------- 目录浏览（文件夹 / 文件选择） ----------
+
+# 选择器中可直接选中的资源文件类型（安卓容器 + Unity bundle）
+SELECTABLE_FILE_EXTS = {
+    ".apk", ".obb", ".assets", ".unity3d", ".bundle", ".unityweb",
+    ".dat", ".bytes", ".bin", ".resource", ".ress",
+    ".split0", ".split1", ".split2", ".split3",
+}
+
 
 @app.get("/api/fs/list")
 def api_fs_list(path: str | None = None):
@@ -242,6 +252,8 @@ def api_fs_list(path: str | None = None):
                 continue
             if child.is_dir():
                 entries.append({"name": child.name, "path": str(child), "type": "dir"})
+            elif child.suffix.lower() in SELECTABLE_FILE_EXTS:
+                entries.append({"name": child.name, "path": str(child), "type": "file"})
     except PermissionError:
         pass
     return {"path": str(p), "parent": str(p.parent) if p.parent != p else None,
@@ -301,6 +313,46 @@ def api_scan_status():
     return st
 
 
+@app.post("/api/scan/pause")
+def api_scan_pause():
+    job: ScanJob | None = _state["scan"]
+    if job is None:
+        raise HTTPException(400, "无扫描任务")
+    job.pause()
+    return {"state": job.state}
+
+
+@app.post("/api/scan/resume")
+def api_scan_resume():
+    job: ScanJob | None = _state["scan"]
+    if job is None:
+        raise HTTPException(400, "无扫描任务")
+    job.resume()
+    return {"state": job.state}
+
+
+@app.post("/api/project/remove")
+def api_project_remove():
+    """移除当前项目：停止后台任务、清空清单与解析缓存以释放内存（收藏保留）。"""
+    for key in ("scan", "export"):
+        job = _state.get(key)
+        if job is not None:
+            job.cancel()
+    for job in _clip_jobs.values():
+        job.cancel()
+    _clip_jobs.clear()
+    with _env_lock:
+        _env_cache.clear()
+        _env_deps_cache.clear()
+    _state.update(detect=None, scan=None, scan_path=None, assets=[], export=None)
+    try:
+        SESSION_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    gc.collect()
+    return {"removed": True}
+
+
 @app.get("/api/session")
 def api_session():
     det = _state["detect"] or {}
@@ -324,6 +376,49 @@ def api_assets(type: str | None = None, search: str = "", offset: int = 0, limit
         s = search.lower()
         items = [a for a in items if s in a["name"].lower() or s in a["container"].lower()]
     return {"total": len(items), "items": items[offset:offset + limit]}
+
+
+# ---------- CG 画廊（大图候选，复用元数据，无需解码） ----------
+
+def _image_dims(meta: dict) -> tuple[int, int]:
+    e = meta.get("extra") or {}
+    if meta["type"] == "Sprite":
+        r = e.get("rect") or [0, 0]
+        return int(r[0]), int(r[1])
+    return int(e.get("width", 0)), int(e.get("height", 0))
+
+
+# 游戏通常把 CG 放进命名含 photos/cg/gallery 等的 bundle（Addressables 常见约定）。
+# 按来源 bundle 名识别“游戏判定的 CG”，纯命名启发式，跨游戏通用。
+_CG_SOURCE_RE = re.compile(r"(?:^|[_\-./])(photos?|cg|gallery|illust|albums?)(?:[_\-./]|$)", re.I)
+
+
+def _is_cg_source(meta: dict) -> bool:
+    return bool(_CG_SOURCE_RE.search(meta.get("file", "")))
+
+
+@app.get("/api/gallery")
+def api_gallery(min_side: int = 400, search: str = "", offset: int = 0, limit: int = 60,
+                cg_only: bool = False):
+    cands = []
+    s = search.lower()
+    cg_available = False
+    for a in _state["assets"]:
+        if a["type"] not in ("Texture2D", "Sprite"):
+            continue
+        is_cg = _is_cg_source(a)
+        cg_available = cg_available or is_cg
+        if cg_only and not is_cg:
+            continue
+        w, h = _image_dims(a)
+        if min_side and min(w, h) < min_side:
+            continue
+        if s and s not in a["name"].lower() and s not in a.get("container", "").lower():
+            continue
+        cands.append((w * h, a))
+    cands.sort(key=lambda x: -x[0])  # 面积降序：大幅 CG 优先
+    return {"total": len(cands), "cg_available": cg_available,
+            "items": [a for _, a in cands[offset:offset + limit]]}
 
 
 # ---------- 收藏 ----------
@@ -402,6 +497,40 @@ def _texture_png(data) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+# ---------- 列表缩略图（图片类资源，小尺寸 + 磁盘缓存） ----------
+
+IMAGE_TYPES = ("Texture2D", "Sprite", "Cubemap")
+THUMB_DIR = CACHE_DIR / "thumbs"
+THUMB_DIR.mkdir(exist_ok=True)
+_thumb_sem = threading.Semaphore(3)  # 限制并发解码，避免滚动时内存尖峰
+
+
+@app.get("/api/thumbnail/{aid}")
+def api_thumbnail(aid: int):
+    if aid < 0 or aid >= len(_state["assets"]):
+        raise HTTPException(404, "资源不存在，请先扫描")
+    meta = _state["assets"][aid]
+    if meta["type"] not in IMAGE_TYPES:
+        raise HTTPException(400, "非图片资源")
+    key = hashlib.md5(_asset_key(meta).encode("utf-8")).hexdigest()[:16]
+    png = THUMB_DIR / f"{key}.png"
+    if not png.exists():
+        with _thumb_sem:
+            if not png.exists():
+                _, reader = _get_reader(aid)
+                try:
+                    img = reader.read().image
+                except Exception as e:
+                    raise HTTPException(500, f"缩略图生成失败: {e}")
+                img.thumbnail((64, 64))
+                if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                    img = img.convert("RGBA")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                png.write_bytes(buf.getvalue())
+    return FileResponse(png, media_type="image/png")
 
 
 @app.get("/api/preview/{aid}")
@@ -510,7 +639,13 @@ class ClipMatchJob:
         self.results: list[dict] = []
         self.error: str | None = None
         self._lock = threading.Lock()
+        self._cancelled = False
         threading.Thread(target=self._run, daemon=True).start()
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            self.state = "cancelled"
 
     def _run(self):
         try:
@@ -521,6 +656,8 @@ class ClipMatchJob:
             self.total = len(byfile)
             matched = []
             for fp, items in byfile.items():
+                if self._cancelled:
+                    break
                 try:
                     env = UnityPy.load(fp)
                 except Exception:
@@ -558,10 +695,12 @@ class ClipMatchJob:
             matched.sort(key=lambda x: (not x["boost"], -x["ratio"], x["name"]))
             with self._lock:
                 self.results = matched
-            self.state = "done"
+            if not self._cancelled:
+                self.state = "done"
         except Exception as e:
-            self.state = "error"
-            self.error = str(e)
+            if not self._cancelled:
+                self.state = "error"
+                self.error = str(e)
 
     def status(self):
         with self._lock:
@@ -627,7 +766,13 @@ class ExportJob:
         self.errors: list[str] = []
         self.written: list[str] = []
         self._lock = threading.Lock()
+        self._cancelled = False
         threading.Thread(target=self._run, daemon=True).start()
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            self.state = "cancelled"
 
     def _write(self, sub: str, name: str, ext: str, content: bytes | str):
         d = self.out_dir / sub
@@ -643,6 +788,8 @@ class ExportJob:
     def _run(self):
         try:
             for aid in self.ids:
+                if self._cancelled:
+                    break
                 if aid >= len(_state["assets"]):
                     continue
                 meta = _state["assets"][aid]
@@ -690,10 +837,12 @@ class ExportJob:
                         self.errors.append(f"{name}: {e}")
                 with self._lock:
                     self.done += 1
-            self.state = "done"
+            if not self._cancelled:
+                self.state = "done"
         except Exception as e:
-            self.state = "error"
-            self.errors.append(str(e))
+            if not self._cancelled:
+                self.state = "error"
+                self.errors.append(str(e))
 
     def status(self):
         with self._lock:

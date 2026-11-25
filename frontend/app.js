@@ -12,6 +12,7 @@ const TYPE_ZH = {
   Font: '字体', Cubemap: '立方体贴图', VideoClip: '视频片段',
 };
 const zh = (t) => TYPE_ZH[t] || t;
+const IMAGE_TYPES = ['Texture2D', 'Sprite', 'Cubemap'];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -97,11 +98,15 @@ async function loadFolder(path) {
   $('folderUp').disabled = !d.parent;
   const ul = $('folderList');
   ul.innerHTML = '';
-  if (!d.entries.length) ul.innerHTML = '<li class="empty">（无子文件夹）</li>';
+  if (!d.entries.length) ul.innerHTML = '<li class="empty">（空目录）</li>';
   for (const e of d.entries) {
     const li = document.createElement('li');
-    li.innerHTML = `<span class="ico">${e.type === 'drive' ? '💽' : '📁'}</span><span>${e.name}</span>`;
-    li.ondblclick = () => loadFolder(e.path);
+    const ico = e.type === 'drive' ? '💽' : e.type === 'file' ? '📦' : '📁';
+    li.innerHTML = `<span class="ico">${ico}</span><span>${esc(e.name)}</span>`;
+    li.ondblclick = () => {
+      if (e.type === 'file') chooseFolderEntry(e.path);
+      else loadFolder(e.path);
+    };
     li.onclick = () => {
       folderSel = e.path;
       [...ul.children].forEach(x => x.classList.remove('sel'));
@@ -114,13 +119,13 @@ $('btnBrowse').onclick = () => openFolder($('pathInput').value.trim() || null);
 $('folderUp').onclick = () => loadFolder(folderCur ? parentOf(folderCur) : null);
 $('folderDrives').onclick = () => loadFolder(null);
 $('folderCancel').onclick = () => $('folderDialog').classList.add('hidden');
-$('folderChoose').onclick = () => {
-  const p = folderSel || folderCur;
-  if (!p) return toast('请选择一个文件夹', true);
+function chooseFolderEntry(p) {
+  if (!p) return toast('请选择一个文件夹或文件', true);
   $('pathInput').value = p;
   $('folderDialog').classList.add('hidden');
   $('btnDetect').click();
-};
+}
+$('folderChoose').onclick = () => chooseFolderEntry(folderSel || folderCur);
 function parentOf(p) {
   const i = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
   if (i <= 2) return null;
@@ -129,12 +134,13 @@ function parentOf(p) {
 
 // ---------------- 识别 / 扫描 ----------------
 function setProject(path) {
+  const row = $('projRow');
+  if (!path) { row.classList.add('hidden'); return; }
   const el = $('projName');
-  if (!path) { el.classList.add('hidden'); return; }
   const name = path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path;
   el.textContent = '📦 ' + name;
   el.title = path;
-  el.classList.remove('hidden');
+  row.classList.remove('hidden');
 }
 function showEngineBadge(d) {
   const badge = $('engineBadge');
@@ -182,18 +188,25 @@ function pollScan() {
   clearTimeout(state.scanTimer);
   state.scanTimer = setTimeout(async () => {
     const st = await (await api('/api/scan/status')).json();
+    $('btnGallery').disabled = !st.asset_count;
     const pct = st.total_files ? Math.round(st.done_files / st.total_files * 100) : 0;
     const p = $('scanProgress');
     p.querySelector('.bar').style.width = pct + '%';
-    p.querySelector('.label').textContent =
-      st.state === 'running' ? `扫描中 ${st.done_files}/${st.total_files} · ${st.asset_count}` : '';
-    if (st.state === 'running') {
+    const pauseBtn = $('btnScanPause');
+    if (st.state === 'running' || st.state === 'paused') {
+      pauseBtn.classList.remove('hidden');
+      pauseBtn.disabled = false;
+      pauseBtn.textContent = st.state === 'paused' ? '继续' : '暂停';
+      p.querySelector('.label').textContent = st.state === 'paused'
+        ? `已暂停 ${st.done_files}/${st.total_files} · ${st.asset_count}`
+        : `扫描中 ${st.done_files}/${st.total_files} · ${st.asset_count}`;
       state._pollN = (state._pollN || 0) + 1;
       if (st.asset_count && state._pollN % 4 === 0) {
         renderTypeList(st.type_counts); loadAssets(); $('btnExportAll').disabled = false;
       }
       return pollScan();
     }
+    pauseBtn.classList.add('hidden');
     $('btnScan').disabled = false;
     if (st.state === 'error') return toast('扫描出错: ' + st.error, true);
     p.querySelector('.label').textContent = `完成 · ${st.asset_count} 资源`;
@@ -202,6 +215,62 @@ function pollScan() {
     loadFavorites();
     $('btnExportAll').disabled = false;
   }, 500);
+}
+$('btnScanPause').onclick = async () => {
+  const btn = $('btnScanPause');
+  btn.disabled = true;
+  try {
+    const action = btn.textContent === '暂停' ? 'pause' : 'resume';
+    await postJson('/api/scan/' + action, {});
+  } catch (e) { toast(e.message, true); }
+  btn.disabled = false;
+};
+
+$('btnRemoveProject').onclick = async () => {
+  if (!confirm('移除当前项目？\n将停止扫描/导出、清空资源清单并释放内存（收藏保留）。')) return;
+  try { await postJson('/api/project/remove', {}); }
+  catch (e) { return toast(e.message, true); }
+  resetProjectUI();
+  toast('项目已移除，内存已释放');
+};
+function resetProjectUI() {
+  clearTimeout(state.scanTimer);
+  clearTimeout(state.exportTimer);
+  Object.assign(state, {
+    detected: null, typeFilter: null, search: '', total: 0, items: [], page: 0,
+    current: null, favMode: false, favType: null, sortKey: null, sortDir: 1,
+  });
+  state.selected.clear();
+  selRow = null;
+  $('pathInput').value = '';
+  $('projRow').classList.add('hidden');
+  $('engineBadge').classList.add('hidden');
+  $('scanProgress').classList.add('hidden');
+  $('btnScanPause').classList.add('hidden');
+  $('btnScan').disabled = true;
+  $('btnExportAll').disabled = true;
+  $('btnGallery').disabled = true;
+  closeGallery();
+  $('searchInput').value = '';
+  $('checkAll').checked = false;
+  for (const id of ['thName', 'thSize']) $(id).querySelector('.arrow').textContent = '';
+  updateExportButtons();
+  $('typeList').innerHTML = '<li class="empty">尚未扫描</li>';
+  $('assetTbody').innerHTML = '<tr><td colspan="7" class="empty">选择游戏目录 → 识别引擎 → 扫描资源</td></tr>';
+  $('listCount').textContent = '0 项';
+  $('pageLabel').textContent = '1 / 1';
+  $('btnPrev').disabled = $('btnNext').disabled = true;
+  loadFavorites();
+  hideAnimPanel();
+  Object.assign(anim, { charId: null, clipName: '', clips: [], duration: 0, textured: false, seeking: false });
+  previewToken++;
+  destroyViewerCanvas();
+  $('previewTitle').textContent = '预览';
+  $('previewMeta').innerHTML = '';
+  $('previewActions').innerHTML = '';
+  $('previewBody').innerHTML = '<div class="placeholder">点击左侧资源进行预览</div>';
+  $('exportDialog').classList.add('hidden');
+  closeFavDialog();
 }
 
 function renderTypeList(counts) {
@@ -287,9 +356,13 @@ function buildRow(a) {
   tr.dataset.id = a.id;
   if (state.current?.id === a.id) { tr.classList.add('selected'); selRow = tr; }
   const fav = state.favIds.has(a.id);
-  const nameCell = a.alias
-    ? `<td class="name" title="${esc(a.name)}"><div class="fav-name-cell"><span>${esc(a.alias)}</span><span class="orig">${esc(a.name)}</span></div></td>`
-    : `<td class="name" title="${esc(a.name)}">${esc(a.name)}</td>`;
+  const thumb = IMAGE_TYPES.includes(a.type)
+    ? `<img class="thumb" loading="lazy" decoding="async" alt="" src="/api/thumbnail/${a.id}" onerror="this.remove()">`
+    : '';
+  const nameInner = a.alias
+    ? `<div class="fav-name-cell"><span>${esc(a.alias)}</span><span class="orig">${esc(a.name)}</span></div>`
+    : `<span class="name-text">${esc(a.name)}</span>`;
+  const nameCell = `<td class="name" title="${esc(a.name)}"><div class="name-wrap">${nameInner}${thumb}</div></td>`;
   tr.innerHTML = `
     <td class="col-check"><input type="checkbox" ${state.selected.has(a.id) ? 'checked' : ''}></td>
     <td class="col-fav"><button class="fav-star ${fav ? 'on' : ''}" title="${fav ? '取消收藏' : '收藏'}">${fav ? '★' : '☆'}</button></td>
@@ -343,7 +416,7 @@ document.addEventListener('keydown', (e) => {
   if (t && (t.isContentEditable || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' ||
       (t.tagName === 'INPUT' && t.type !== 'checkbox'))) return;
   if (!$('folderDialog').classList.contains('hidden') || !$('exportDialog').classList.contains('hidden') ||
-      !$('favDialog').classList.contains('hidden')) return;
+      !$('favDialog').classList.contains('hidden') || !$('galleryOverlay').classList.contains('hidden')) return;
   e.preventDefault();
   navigateList(e.key === 'ArrowDown' ? 1 : -1);
 });
@@ -583,7 +656,10 @@ function initViewer() {
       v.root.remove(c);
       c.traverse?.(o => {
         o.geometry?.dispose?.();
-        if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => m.dispose());
+        if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => {
+          for (const k of Object.keys(m)) { const t = m[k]; if (t && t.isTexture) t.dispose(); }
+          m.dispose();
+        });
       });
     }
   };
@@ -626,20 +702,35 @@ function mountCanvas() {
   v.resize();
   return v;
 }
+function showPreviewLoading(text = '加载中…') {
+  hidePreviewLoading();
+  const el = document.createElement('div');
+  el.className = 'spinner'; el.id = 'previewLoading'; el.textContent = text;
+  $('previewBody').appendChild(el);
+}
+function hidePreviewLoading() {
+  document.getElementById('previewLoading')?.remove();
+}
 async function showMeshPreview(a, token, opts = {}) {
   const { refresh = false, textured = false } = opts;
   hideAnimPanel();
   const v = mountCanvas();
+  showPreviewLoading(textured ? '贴图加载中…' : '模型加载中…');
   const q = [];
   if (refresh) q.push('refresh=1');
   if (textured) q.push('textured=1');
   const url = `/api/preview/${a.id}` + (q.length ? '?' + q.join('&') : '');
-  const buf = await (await api(url)).arrayBuffer();
-  const gltf = await parseGLB(buf);
-  if (token !== previewToken) return;
-  v.clear();
-  v.root.add(gltf.scene);
-  v.frame(gltf.scene);
+  let gltf;
+  try {
+    const buf = await (await api(url)).arrayBuffer();
+    gltf = await parseGLB(buf);
+    if (token !== previewToken) return;
+    v.clear();
+    v.root.add(gltf.scene);
+    v.frame(gltf.scene);
+  } finally {
+    hidePreviewLoading();
+  }
   const actions = [
     { label: '线框', fn: (btn) => {
       v.wireframe = !v.wireframe;
@@ -706,14 +797,20 @@ async function showAnimPreview(a, token) {
   const ct = r.headers.get('content-type') || '';
   if (ct.includes('gltf-binary')) {
     const v = mountCanvas();
-    const gltf = await parseGLB(await r.arrayBuffer());
-    if (token !== previewToken) return;
-    v.clear();
-    v.root.add(gltf.scene);
-    const viz = buildBoneViz(v, gltf.scene);
-    v.root.add(viz.lines);
-    v.boneViz = viz;
-    v.frame(gltf.scene);
+    showPreviewLoading('动画加载中…');
+    let gltf;
+    try {
+      gltf = await parseGLB(await r.arrayBuffer());
+      if (token !== previewToken) return;
+      v.clear();
+      v.root.add(gltf.scene);
+      const viz = buildBoneViz(v, gltf.scene);
+      v.root.add(viz.lines);
+      v.boneViz = viz;
+      v.frame(gltf.scene);
+    } finally {
+      hidePreviewLoading();
+    }
     if (gltf.animations.length) {
       v.mixer = new THREE.AnimationMixer(gltf.scene);
       const action = v.mixer.clipAction(gltf.animations[0]);
@@ -997,6 +1094,151 @@ function pollExport() {
 
 $('pathInput').addEventListener('keydown', e => { if (e.key === 'Enter') doDetect(); });
 
+// ---------------- CG 画廊 ----------------
+const gallery = {
+  open: false, items: [], total: 0, page: 0, pageSize: 60,
+  search: '', bigOnly: true, cgOnly: true, cgAvailable: false,
+  lbIndex: -1, zoom: 1, panX: 0, panY: 0,
+};
+function openGallery() {
+  gallery.open = true;
+  $('galleryOverlay').classList.remove('hidden');
+  loadGallery();
+}
+function closeGallery() {
+  gallery.open = false;
+  closeLightbox();
+  $('galleryOverlay').classList.add('hidden');
+}
+async function loadGallery() {
+  const params = new URLSearchParams({
+    min_side: gallery.bigOnly ? 400 : 0, search: gallery.search,
+    cg_only: gallery.cgOnly, offset: gallery.page * gallery.pageSize, limit: gallery.pageSize,
+  });
+  const d = await (await api('/api/gallery?' + params)).json();
+  gallery.cgAvailable = d.cg_available;
+  // 无 CG 命名来源的游戏：自动回退到“仅大图”，避免空画廊
+  if (d.total === 0 && gallery.cgOnly && !d.cg_available) {
+    gallery.cgOnly = false; $('galleryCgOnly').checked = false;
+    return loadGallery();
+  }
+  gallery.items = d.items; gallery.total = d.total;
+  renderGalleryGrid();
+}
+function renderGalleryGrid() {
+  const grid = $('galleryGrid');
+  const pages = Math.max(1, Math.ceil(gallery.total / gallery.pageSize));
+  gallery.page = Math.min(gallery.page, pages - 1);
+  $('galleryCount').textContent = `${gallery.total} 张`;
+  $('galleryPage').textContent = `${gallery.page + 1} / ${pages}`;
+  $('galleryPrev').disabled = gallery.page === 0;
+  $('galleryNext').disabled = gallery.page >= pages - 1;
+  grid.innerHTML = '';
+  if (!gallery.items.length) { grid.innerHTML = '<div class="gallery-empty">无匹配图片</div>'; return; }
+  const frag = document.createDocumentFragment();
+  gallery.items.forEach((a, i) => {
+    const card = document.createElement('div');
+    card.className = 'g-card';
+    card.innerHTML = `<div class="g-img"><img loading="lazy" decoding="async" alt="" src="/api/thumbnail/${a.id}" onerror="this.parentNode.classList.add('broken')"></div><div class="g-cap" title="${esc(a.name)}">${esc(a.name)}</div>`;
+    card.onclick = () => openLightbox(i);
+    frag.appendChild(card);
+  });
+  grid.appendChild(frag);
+  grid.scrollTop = 0;
+}
+$('btnGallery').onclick = openGallery;
+$('galleryClose').onclick = closeGallery;
+$('galleryPrev').onclick = () => { gallery.page--; loadGallery(); };
+$('galleryNext').onclick = () => { gallery.page++; loadGallery(); };
+$('galleryBigOnly').onchange = (e) => { gallery.bigOnly = e.target.checked; gallery.page = 0; loadGallery(); };
+$('galleryCgOnly').onchange = (e) => { gallery.cgOnly = e.target.checked; gallery.page = 0; loadGallery(); };
+let gallerySearchTimer;
+$('gallerySearch').oninput = (e) => {
+  clearTimeout(gallerySearchTimer);
+  gallerySearchTimer = setTimeout(() => { gallery.search = e.target.value.trim(); gallery.page = 0; loadGallery(); }, 300);
+};
+
+// ---------------- 全屏灯箱 ----------------
+function openLightbox(i) {
+  gallery.lbIndex = i;
+  $('lightbox').classList.remove('hidden');
+  lbShow();
+}
+function closeLightbox() {
+  $('lightbox').classList.add('hidden');
+  gallery.lbIndex = -1;
+  $('lbImg').removeAttribute('src');
+}
+function lbShow() {
+  const a = gallery.items[gallery.lbIndex];
+  if (!a) return;
+  gallery.zoom = 1; gallery.panX = 0; gallery.panY = 0;
+  lbApply();
+  $('lbName').textContent = a.name;
+  $('lbCounter').textContent = `${gallery.lbIndex + 1} / ${gallery.items.length}`;
+  $('lbImg').src = `/api/preview/${a.id}`;
+}
+function lbApply() {
+  $('lbImg').style.transform = `translate(${gallery.panX}px, ${gallery.panY}px) scale(${gallery.zoom})`;
+  $('lbZoomLabel').textContent = Math.round(gallery.zoom * 100) + '%';
+}
+function lbNav(dir) {
+  const n = gallery.items.length;
+  if (!n) return;
+  gallery.lbIndex = (gallery.lbIndex + dir + n) % n;
+  lbShow();
+}
+function lbZoom(factor) {
+  gallery.zoom = Math.min(8, Math.max(0.2, gallery.zoom * factor));
+  lbApply();
+}
+$('lbClose').onclick = closeLightbox;
+$('lbPrev').onclick = () => lbNav(-1);
+$('lbNext').onclick = () => lbNav(1);
+$('lbZoomIn').onclick = () => lbZoom(1.25);
+$('lbZoomOut').onclick = () => lbZoom(0.8);
+$('lbZoomReset').onclick = () => { gallery.zoom = 1; gallery.panX = 0; gallery.panY = 0; lbApply(); };
+$('lbStage').addEventListener('wheel', (e) => { e.preventDefault(); lbZoom(e.deltaY < 0 ? 1.15 : 0.87); }, { passive: false });
+(() => {
+  const stage = $('lbStage');
+  let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+  stage.addEventListener('pointerdown', (e) => {
+    dragging = true; sx = e.clientX; sy = e.clientY; ox = gallery.panX; oy = gallery.panY;
+    stage.setPointerCapture(e.pointerId); stage.classList.add('grabbing');
+  });
+  stage.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    gallery.panX = ox + (e.clientX - sx); gallery.panY = oy + (e.clientY - sy);
+    lbApply();
+  });
+  const up = () => { dragging = false; stage.classList.remove('grabbing'); };
+  stage.addEventListener('pointerup', up);
+  stage.addEventListener('pointercancel', up);
+})();
+$('lbDownload').onclick = async () => {
+  const a = gallery.items[gallery.lbIndex];
+  if (!a) return;
+  try {
+    const blob = await (await api(`/api/preview/${a.id}`)).blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = `${a.name}.png`;
+    link.click();
+    URL.revokeObjectURL(url);
+    toast('已下载：' + a.name);
+  } catch (e) { toast('下载失败：' + e.message, true); }
+};
+document.addEventListener('keydown', (e) => {
+  if (!gallery.open) return;
+  const lbOpen = !$('lightbox').classList.contains('hidden');
+  if (e.key === 'Escape') { lbOpen ? closeLightbox() : closeGallery(); return; }
+  if (!lbOpen) return;
+  if (e.key === 'ArrowLeft') lbNav(-1);
+  else if (e.key === 'ArrowRight') lbNav(1);
+  else if (e.key === '+' || e.key === '=') lbZoom(1.25);
+  else if (e.key === '-') lbZoom(0.8);
+});
+
 // 启动时恢复上一次打开的项目
 (async () => {
   initDividers();
@@ -1013,7 +1255,7 @@ $('pathInput').addEventListener('keydown', e => { if (e.key === 'Enter') doDetec
     const st = await (await api('/api/scan/status')).json();
     if (st.state === 'idle') return;
     $('scanProgress').classList.remove('hidden');
-    if (st.asset_count) { renderTypeList(st.type_counts); loadAssets(); $('btnExportAll').disabled = false; }
+    if (st.asset_count) { renderTypeList(st.type_counts); loadAssets(); $('btnExportAll').disabled = false; $('btnGallery').disabled = false; }
     if (st.state === 'running') { $('btnScan').disabled = true; pollScan(); }
     else $('scanProgress').querySelector('.label').textContent = `完成 · ${st.asset_count} 资源`;
   } catch {}
