@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Asset Explorer · 游戏资源提取</title>
-<link rel="stylesheet" href="/style.css?v=16">
+<link rel="stylesheet" href="/style.css?v=18">
 <script type="importmap">
 {
   "imports": {
@@ -16,14 +16,13 @@
 </head>
 <body>
 <header id="topbar">
-  <div class="brand">Asset<span>Explorer</span></div>
+  <div class="brand" id="brandHome" title="返回项目中心">Asset<span>Explorer</span></div>
   <div class="pathbox">
     <input id="pathInput" type="text" placeholder="游戏目录 / APK / OBB / 资源文件路径" spellcheck="false">
     <button id="btnBrowse" class="btn icon" title="选择目录或文件">📁</button>
   </div>
   <button id="btnDetect" class="btn">识别引擎</button>
   <button id="btnScan" class="btn primary" disabled>扫描资源</button>
-  <button id="btnExample" class="btn ghost" title="载入参考示例游戏">示例</button>
   <div id="engineBadge" class="badge hidden"></div>
   <div id="scanProgress" class="progress hidden"><div class="bar"></div><span class="label"></span></div>
   <button id="btnScanPause" class="btn small hidden">暂停</button>
@@ -99,6 +98,44 @@
     <div id="previewMeta"></div>
   </section>
 </main>
+
+<div id="home" class="home hidden">
+  <div class="home-inner">
+    <div class="home-head">
+      <div class="home-brand">Asset<span>Explorer</span></div>
+      <button id="homeBack" class="btn ghost hidden">返回工作台 →</button>
+    </div>
+    <div class="home-hero">
+      <h1>游戏资源工作台</h1>
+      <p class="home-sub">识别 · 提取 · 预览 · 导出 · 参数修改 —— 打开一个游戏项目开始</p>
+      <div class="home-open">
+        <button id="homeOpen" class="btn primary home-cta">📁 打开项目</button>
+        <div class="home-path">
+          <input id="homePath" type="text" placeholder="或粘贴路径：游戏目录 / APK / OBB / 资源文件" spellcheck="false">
+          <button id="homeDetect" class="btn">识别</button>
+        </div>
+      </div>
+      <div class="home-formats">
+        <span class="fmt-chip">Unity PC 目录</span><span class="fmt-chip">APK</span><span class="fmt-chip">OBB</span><span class="fmt-chip">AssetBundle</span>
+      </div>
+    </div>
+    <div class="home-recent">
+      <div class="home-recent-head">
+        <span class="home-recent-title">最近项目</span><span id="homeCount" class="home-count"></span>
+      </div>
+      <div id="homeGrid" class="home-grid"></div>
+      <div id="homeEmpty" class="home-empty hidden">
+        <div class="home-empty-icon">🗂️</div>
+        <p>还没有打开过项目</p>
+        <ol class="home-steps">
+          <li>选择游戏目录或 APK / OBB 文件</li>
+          <li>自动识别引擎与资源文件</li>
+          <li>扫描后即可浏览 / 预览 / 导出</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div id="folderDialog" class="dialog hidden">
   <div class="dialog-box folder-box">
@@ -249,6 +286,6 @@
 </div>
 
 <div id="toast" class="hidden"></div>
-<script type="module" src="/app.js?v=33"></script>
+<script type="module" src="/app.js?v=34"></script>
 </body>
 </html>

@@ -4,7 +4,6 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE_SIZE = 200;
-const EXAMPLE_PATH = 'H:\\87VR游戏大厅\\Romantic.Escapades.v2.0.3\\Romantic Escapades';
 
 const TYPE_ZH = {
   Character: '角色', Mesh: '模型', Texture2D: '贴图', Sprite: '精灵图', AnimationClip: '动画片段',
@@ -120,12 +119,16 @@ async function loadFolder(path) {
 $('btnBrowse').onclick = () => openFolder($('pathInput').value.trim() || null);
 $('folderUp').onclick = () => loadFolder(folderCur ? parentOf(folderCur) : null);
 $('folderDrives').onclick = () => loadFolder(null);
-$('folderCancel').onclick = () => $('folderDialog').classList.add('hidden');
-function chooseFolderEntry(p) {
+$('folderCancel').onclick = () => { state._homePick = false; $('folderDialog').classList.add('hidden'); };
+async function chooseFolderEntry(p) {
   if (!p) return toast('请选择一个文件夹或文件', true);
   $('pathInput').value = p;
   $('folderDialog').classList.add('hidden');
-  $('btnDetect').click();
+  await doDetect();
+  if (state._homePick) {
+    state._homePick = false;
+    if (state.detected?.supported) { closeHome(); $('btnScan').click(); }
+  }
 }
 $('folderChoose').onclick = () => chooseFolderEntry(folderSel || folderCur);
 function parentOf(p) {
@@ -173,7 +176,6 @@ async function doDetect() {
   } catch (e) { toast(e.message, true); }
 }
 $('btnDetect').onclick = doDetect;
-$('btnExample').onclick = () => { $('pathInput').value = EXAMPLE_PATH; doDetect(); };
 
 $('btnScan').onclick = async () => {
   try {
@@ -276,6 +278,7 @@ function resetProjectUI() {
   $('previewBody').innerHTML = '<div class="placeholder">点击左侧资源进行预览</div>';
   $('exportDialog').classList.add('hidden');
   closeFavDialog();
+  openHome();
 }
 
 function renderTypeList(counts) {
@@ -1592,11 +1595,98 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === '-') lbZoom(0.8);
 });
 
+// ---------------- 项目中心（初始界面：打开引导 + 历史项目 + 识别状态） ----------------
+const home = { open: false, timer: null };
+const SCAN_ZH = {
+  idle: ['未识别', 'st-idle'], scanning: ['识别中', 'st-run'],
+  paused: ['已暂停', 'st-pause'], done: ['已识别', 'st-done'],
+};
+function openHome() {
+  home.open = true;
+  $('home').classList.remove('hidden');
+  loadHome();
+}
+function closeHome() {
+  home.open = false;
+  $('home').classList.add('hidden');
+  clearTimeout(home.timer);
+}
+async function loadHome() {
+  let d;
+  try { d = await (await api('/api/projects')).json(); } catch { return; }
+  const ps = d.projects || [];
+  $('homeCount').textContent = ps.length ? `${ps.length} 个` : '';
+  $('homeEmpty').classList.toggle('hidden', ps.length > 0);
+  $('homeBack').classList.toggle('hidden', !ps.some(p => p.current && p.asset_count));
+  const grid = $('homeGrid');
+  grid.innerHTML = '';
+  const frag = document.createDocumentFragment();
+  for (const p of ps) frag.appendChild(homeCard(p));
+  grid.appendChild(frag);
+  clearTimeout(home.timer);
+  if (home.open && ps.some(p => p.scan_state === 'scanning')) home.timer = setTimeout(loadHome, 2000);
+}
+function fmtAgo(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return '刚刚';
+  if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
+  if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
+  return Math.floor(s / 86400) + ' 天前';
+}
+function homeCard(p) {
+  const card = document.createElement('div');
+  card.className = 'home-card' + (p.current ? ' current' : '');
+  const [sz, sc] = SCAN_ZH[p.scan_state] || SCAN_ZH.idle;
+  const engine = [p.engine_label, p.unity_version,
+    p.scripting_backend && p.scripting_backend !== 'unknown' ? p.scripting_backend : '']
+    .filter(Boolean).join(' · ');
+  const prog = (p.scan_state === 'scanning' && p.total_files)
+    ? `<div class="hc-prog"><div class="bar" style="width:${Math.round((p.done_files || 0) / p.total_files * 100)}%"></div></div>` : '';
+  card.innerHTML =
+    `<div class="hc-top"><span class="hc-name" title="${esc(p.path)}">${esc(p.name)}</span>` +
+    `<span class="hc-status ${sc}"><i></i>${sz}</span></div>` +
+    `<div class="hc-engine">${esc(engine || '未识别引擎')}</div>` +
+    `<div class="hc-path" title="${esc(p.path)}">${esc(p.path)}</div>` + prog +
+    `<div class="hc-meta"><span>${p.asset_count ? p.asset_count + ' 资源' : (p.asset_file_count ? p.asset_file_count + ' 资源文件' : '—')}</span><span>${fmtAgo(p.last_opened)}</span></div>` +
+    `<div class="hc-actions"><button class="btn small primary hc-open">${p.current && p.asset_count ? '继续' : '打开'}</button>` +
+    `<button class="btn small ghost hc-del" title="从列表移除">✕</button></div>`;
+  card.querySelector('.hc-open').onclick = () => openProject(p);
+  card.querySelector('.hc-del').onclick = async (ev) => {
+    ev.stopPropagation();
+    if (p.current) { $('btnRemoveProject').click(); return; }
+    if (!confirm(`从最近项目移除「${p.name}」？（不影响磁盘文件）`)) return;
+    try { await postJson('/api/projects/remove', { path: p.path }); loadHome(); }
+    catch (e) { toast(e.message, true); }
+  };
+  return card;
+}
+async function openProject(p) {
+  $('pathInput').value = p.path;
+  if (p.current && (p.asset_count || p.scan_state === 'scanning' || p.scan_state === 'paused')) {
+    closeHome(); return;
+  }
+  await doDetect();
+  if (state.detected?.supported) { closeHome(); $('btnScan').click(); }
+  else if (state.detected?.engine) closeHome();
+}
+$('homeOpen').onclick = () => { state._homePick = true; openFolder($('homePath').value.trim() || null); };
+$('homeDetect').onclick = async () => {
+  const v = $('homePath').value.trim();
+  if (!v) return toast('请输入路径', true);
+  $('pathInput').value = v;
+  await doDetect();
+  if (state.detected?.supported) { closeHome(); $('btnScan').click(); }
+};
+$('homeBack').onclick = closeHome;
+$('brandHome').onclick = openHome;
+
 // 启动时恢复上一次打开的项目
 (async () => {
   initDividers();
   initSidebarToggles();
   loadFavorites();
+  openHome();
   try {
     const sess = await (await api('/api/session')).json();
     if (sess.active) {

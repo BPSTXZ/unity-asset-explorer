@@ -11,6 +11,7 @@ import re
 import shutil
 import string
 import threading
+import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +78,85 @@ def _restore_session():
 
 
 _restore_session()
+
+# ---------- 项目历史（项目中心初始界面：已打开过的项目 + 识别状态） ----------
+PROJECTS_FILE = CACHE_DIR / "projects.json"
+_projects: list[dict] = []
+_proj_lock = threading.Lock()
+
+
+def _norm_path(p: str) -> str:
+    return os.path.normpath((p or "").strip().strip('"')).lower()
+
+
+def _load_projects():
+    global _projects
+    try:
+        _projects = json.loads(PROJECTS_FILE.read_text(encoding="utf-8")) or []
+    except (OSError, ValueError):
+        _projects = []
+
+
+def _save_projects():
+    try:
+        PROJECTS_FILE.write_text(json.dumps(_projects, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _find_project(path: str) -> dict | None:
+    key = _norm_path(path)
+    for p in _projects:
+        if _norm_path(p.get("path", "")) == key:
+            return p
+    return None
+
+
+def _upsert_project(path: str, **fields):
+    if not path:
+        return
+    with _proj_lock:
+        p = _find_project(path)
+        if p is None:
+            p = {"path": path, "name": Path(path).name or path,
+                 "scan_state": "idle", "asset_count": 0}
+            _projects.append(p)
+        p.update(fields)
+        p["last_opened"] = time.time()
+        _save_projects()
+
+
+def _set_project_scan(path: str, scan_state: str, asset_count: int | None = None):
+    with _proj_lock:
+        p = _find_project(path)
+        if p is None:
+            return
+        p["scan_state"] = scan_state
+        if asset_count is not None:
+            p["asset_count"] = asset_count
+        _save_projects()
+
+
+def _forget_project(path: str):
+    with _proj_lock:
+        key = _norm_path(path)
+        _projects[:] = [p for p in _projects if _norm_path(p.get("path", "")) != key]
+        _save_projects()
+
+
+_load_projects()
+
+# 启动时若已有恢复的会话但无历史记录，补一条，保证项目中心能看到当前项目
+if _state["scan_path"] and _find_project(_state["scan_path"]) is None:
+    _det = _state["detect"] or {}
+    _upsert_project(_state["scan_path"],
+                    engine=_det.get("engine"), engine_label=_det.get("engine_label"),
+                    unity_version=_det.get("unity_version"),
+                    scripting_backend=_det.get("scripting_backend"),
+                    supported=_det.get("supported", False),
+                    asset_file_count=len(_det.get("asset_files") or []),
+                    scan_state="done" if _state["assets"] else "idle",
+                    asset_count=len(_state["assets"]))
 
 # ---------- 收藏（别名仅用于个人辨识，与原命名分离，不参与任何解析/导出） ----------
 FAVORITES_FILE = CACHE_DIR / "favorites.json"
@@ -271,6 +351,13 @@ def api_fs_list(path: str | None = None):
 def api_detect(req: PathReq):
     result = detect(req.path.strip().strip('"'))
     _state["detect"] = result
+    if result.get("engine"):
+        _upsert_project(result.get("root") or req.path,
+                        engine=result.get("engine"), engine_label=result.get("engine_label"),
+                        unity_version=result.get("unity_version"),
+                        scripting_backend=result.get("scripting_backend"),
+                        supported=result.get("supported", False),
+                        asset_file_count=len(result.get("asset_files") or []))
     return result
 
 
@@ -293,6 +380,7 @@ def api_scan(req: ScanReq):
         _state["scan_path"] = req.path or str(Path(files[0]).parent)
     else:
         _state["scan_path"] = (_state["detect"] or {}).get("root") or req.path
+    _upsert_project(_state["scan_path"], scan_state="scanning", asset_count=0)
     with _env_lock:
         _env_cache.clear()
     return {"started": True, "total_files": len(files)}
@@ -310,6 +398,12 @@ def api_scan_status():
                     "asset_count": len(_state["assets"]), "type_counts": counts, "error": None}
         return {"state": "idle"}
     st = job.status()
+    if st["state"] != getattr(job, "_proj_state", None):
+        job._proj_state = st["state"]
+        if st["state"] in ("done", "paused"):
+            _set_project_scan(_state["scan_path"], st["state"], st["asset_count"])
+        elif st["state"] == "error":
+            _set_project_scan(_state["scan_path"], "idle")
     if st["asset_count"] and (st["state"] == "done" or len(_state["assets"]) < st["asset_count"]):
         _state["assets"] = job.snapshot()
     if st["state"] == "done" and not getattr(job, "_session_saved", False):
@@ -339,6 +433,7 @@ def api_scan_resume():
 @app.post("/api/project/remove")
 def api_project_remove():
     """移除当前项目：停止后台任务、清空清单与解析缓存以释放内存（收藏保留）。"""
+    path = _state["scan_path"] or (_state["detect"] or {}).get("root")
     for key in ("scan", "export", "keyparam_job"):
         job = _state.get(key)
         if job is not None:
@@ -356,6 +451,7 @@ def api_project_remove():
                   keyparam_job=None, keyparams=[])
     gc.collect()  # 先释放 UnityPy 文件句柄，避免 Windows 下缓存文件被锁
     _clear_disk_caches()
+    _forget_project(path)
     return {"removed": True}
 
 
@@ -394,6 +490,40 @@ def api_session():
             "asset_file_count": len(det.get("asset_files") or []),
             "supported": det.get("supported", False),
             "asset_count": len(_state["assets"])}
+
+
+@app.get("/api/projects")
+def api_projects():
+    """项目中心：历史项目 + 识别状态（当前项目附带实时扫描进度）。"""
+    cur = _state["scan_path"] or (_state["detect"] or {}).get("root")
+    curkey = _norm_path(cur) if cur else None
+    job: ScanJob | None = _state["scan"]
+    with _proj_lock:
+        items = sorted(_projects, key=lambda p: p.get("last_opened", 0), reverse=True)
+    out = []
+    for p in items:
+        d = dict(p)
+        d["current"] = curkey is not None and _norm_path(p.get("path", "")) == curkey
+        if d["current"]:
+            if job is not None:
+                st = job.status()
+                d["scan_state"] = {"running": "scanning", "paused": "paused",
+                                   "done": "done"}.get(st["state"], d.get("scan_state"))
+                d["asset_count"] = st["asset_count"] or d.get("asset_count", 0)
+                d["done_files"] = st["done_files"]
+                d["total_files"] = st["total_files"]
+            elif _state["assets"]:
+                d["scan_state"] = "done"
+                d["asset_count"] = len(_state["assets"])
+        out.append(d)
+    return {"projects": out}
+
+
+@app.post("/api/projects/remove")
+def api_projects_remove(req: PathReq):
+    """从项目中心移除一条历史记录（不清理当前会话）。"""
+    _forget_project(req.path)
+    return {"removed": True}
 
 
 @app.get("/api/assets")
