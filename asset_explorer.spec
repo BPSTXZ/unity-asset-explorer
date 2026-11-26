@@ -2,7 +2,7 @@
 """Asset Explorer 单文件 exe 打包配置。"""
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-datas = [("frontend", "frontend")]
+datas = [("frontend", "frontend"), ("backend/data", "backend/data")]
 binaries = []
 hiddenimports = []
 
@@ -28,7 +28,7 @@ hiddenimports += [
     "uvicorn.protocols.http.h11_impl", "uvicorn.protocols.http.httptools_impl",
     "uvicorn.protocols.websockets", "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan", "uvicorn.lifespan.on", "uvicorn.lifespan.off",
-    "encodings", "backend", "backend.main",
+    "encodings", "backend", "backend.main", "backend.glossary", "backend.translate",
 ]
 
 a = Analysis(

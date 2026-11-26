@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Asset Explorer · 游戏资源提取</title>
-<link rel="stylesheet" href="/style.css?v=11">
+<link rel="stylesheet" href="/style.css?v=16">
 <script type="importmap">
 {
   "imports": {
@@ -41,6 +41,7 @@
     <ul id="favList" class="hidden"><li class="empty">暂无收藏</li></ul>
     <div class="side-title">浏览</div>
     <button id="btnGallery" class="btn wide" disabled>CG 画廊</button>
+    <button id="btnKp" class="btn wide" disabled>关键参数</button>
     <div class="side-title">导出</div>
     <button id="btnExportSelected" class="btn primary wide" disabled>导出选中 (0)</button>
     <button id="btnExportAll" class="btn wide" disabled>导出当前筛选</button>
@@ -163,6 +164,33 @@
   <div id="galleryGrid" class="gallery-grid"></div>
 </div>
 
+<div id="kpOverlay" class="kp hidden">
+  <div class="kp-bar">
+    <span class="kp-title">关键参数</span>
+    <span id="kpCount" class="kp-count"></span>
+    <input id="kpSearch" type="text" placeholder="搜索字段 / 释义 / 脚本 / 概念…">
+    <button id="kpScan" class="btn small primary">一键识别</button>
+    <span id="kpProgress" class="kp-progress"></span>
+    <button id="kpTranslate" class="btn small" title="在线翻译当前页脚本/字段名（日语/生词）">在线翻译</button>
+    <button id="kpSave" class="btn small" disabled>保存修改</button>
+    <button id="kpExport" class="btn small" disabled>导出 bundle</button>
+    <button id="kpTrCfg" class="btn small ghost" title="在线翻译设置">⚙</button>
+    <button id="kpClose" class="btn small ghost">关闭</button>
+  </div>
+  <div id="kpTabs" class="kp-tabs"></div>
+  <div id="kpConcepts" class="kp-concepts hidden"></div>
+  <div id="kpList" class="kp-list"></div>
+  <div class="kp-foot">
+    <div class="pager">
+      <button id="kpPrev" class="btn small">‹</button>
+      <span id="kpPage">0 / 0</span>
+      <button id="kpNext" class="btn small">›</button>
+    </div>
+    <span class="kp-hint">释义为自动翻译，<em class="f-guess">推测</em> 仅供参考 · 修改导出到 exports/_modified，不覆盖原文件</span>
+    <span id="kpPending" class="kp-pending"></span>
+  </div>
+</div>
+
 <div id="lightbox" class="lightbox hidden">
   <div class="lb-top">
     <span id="lbName" class="lb-name"></span>
@@ -181,7 +209,46 @@
   </div>
 </div>
 
+<div id="editDialog" class="dialog hidden">
+  <div class="dialog-box edit-box">
+    <h3>参数编辑 · <span id="editName" class="edit-name"></span></h3>
+    <p class="edit-note">修改导出到 exports/_modified，不覆盖原游戏文件（自行替换生效）。</p>
+    <div id="editBody" class="edit-body"></div>
+    <div class="edit-foot">
+      <span id="editPending" class="edit-pending"></span>
+      <button id="editTranslate" class="btn" title="用百度/有道在线翻译脚本与字段名（日语/生词）">在线翻译</button>
+      <button id="editTrCfg" class="btn ghost" title="在线翻译设置">⚙</button>
+      <button id="editExport" class="btn" disabled>导出修改的 bundle</button>
+      <button id="editApply" class="btn primary" disabled>保存修改</button>
+      <button id="editClose" class="btn">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div id="translateDialog" class="dialog hidden">
+  <div class="dialog-box tr-box">
+    <h3>在线翻译设置</h3>
+    <p class="edit-note">离线词典已覆盖常见英文；在线翻译用于日语、生词或更自然的短语。密钥仅存本机 .cache，不上传、不入库。</p>
+    <div class="tr-form">
+      <label>服务商
+        <select id="trProvider">
+          <option value="baidu">百度翻译</option>
+          <option value="youdao">有道翻译</option>
+        </select>
+      </label>
+      <label>AppID<input id="trAppid" type="text" placeholder="百度 appid / 有道应用ID" autocomplete="off"></label>
+      <label>密钥<input id="trKey" type="password" placeholder="百度密钥 / 有道应用密钥" autocomplete="off"></label>
+    </div>
+    <p class="edit-note">百度：fanyi-api.baidu.com 注册（免费档，QPS=1，已自动批量+限速）。有道：openapi.youdao.com。</p>
+    <div class="edit-foot">
+      <span id="trStatus" class="edit-pending"></span>
+      <button id="trSave" class="btn primary">保存</button>
+      <button id="trClose" class="btn">关闭</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="hidden"></div>
-<script type="module" src="/app.js?v=27"></script>
+<script type="module" src="/app.js?v=33"></script>
 </body>
 </html>

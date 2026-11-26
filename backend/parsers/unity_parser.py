@@ -12,6 +12,7 @@ from ..exporters.character import find_characters
 EXTRACTABLE = {
     "Mesh", "Texture2D", "Sprite", "AnimationClip", "AudioClip",
     "Material", "TextAsset", "Font", "Cubemap", "VideoClip", "Shader",
+    "MonoBehaviour", "ScriptableObject",
 }
 
 
@@ -108,6 +109,14 @@ class ScanJob:
                     except Exception:
                         continue
                     name = getattr(data, "m_Name", "") or ""
+                    cls = ""
+                    if tname in ("MonoBehaviour", "ScriptableObject"):
+                        try:
+                            cls = data.m_Script.read().m_ClassName
+                        except Exception:
+                            cls = ""
+                        if tname == "MonoBehaviour" and not name:
+                            name = cls
                     container = ""
                     try:
                         container = reader.container or ""
@@ -120,7 +129,7 @@ class ScanJob:
                             "path_id": reader.path_id, "file": fname, "file_path": f,
                             "cab": getattr(reader.assets_file, "name", ""),
                             "container": container, "size": reader.byte_size,
-                            "extra": _extra_info(data, tname),
+                            "extra": {**_extra_info(data, tname), **({"class": cls} if cls else {})},
                         })
                         self.type_counts[tname] = self.type_counts.get(tname, 0) + 1
                 if has_smr and not self._cancelled:

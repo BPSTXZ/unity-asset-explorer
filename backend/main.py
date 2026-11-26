@@ -5,6 +5,7 @@ import io
 import gc
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -25,6 +26,8 @@ from .parsers.unity_parser import ScanJob
 from .exporters.gltf import mesh_to_glb, animation_to_glb, animation_info, humanoid_export
 from .exporters.character import character_to_glb, mesh_to_glb_textured, character_bone_crc
 from .paths import CACHE_DIR, EXPORT_DIR, FRONTEND_DIR
+from . import glossary
+from . import translate
 
 CACHE_DIR.mkdir(exist_ok=True, parents=True)
 DEFAULT_EXPORT_DIR = EXPORT_DIR
@@ -47,6 +50,8 @@ _state = {
     "scan_path": None,     # 当前资源项目路径
     "assets": [],          # 扫描清单快照（仅元数据）
     "export": None,        # ExportJob
+    "keyparam_job": None,  # KeyParamJob
+    "keyparams": [],       # 关键参数识别结果
 }
 
 SESSION_FILE = CACHE_DIR / "session.json"
@@ -334,7 +339,7 @@ def api_scan_resume():
 @app.post("/api/project/remove")
 def api_project_remove():
     """移除当前项目：停止后台任务、清空清单与解析缓存以释放内存（收藏保留）。"""
-    for key in ("scan", "export"):
+    for key in ("scan", "export", "keyparam_job"):
         job = _state.get(key)
         if job is not None:
             job.cancel()
@@ -344,7 +349,11 @@ def api_project_remove():
     with _env_lock:
         _env_cache.clear()
         _env_deps_cache.clear()
-    _state.update(detect=None, scan=None, scan_path=None, assets=[], export=None)
+    with _edit_lock:
+        _edit_envs.clear()
+        _edit_pending.clear()
+    _state.update(detect=None, scan=None, scan_path=None, assets=[], export=None,
+                  keyparam_job=None, keyparams=[])
     gc.collect()  # 先释放 UnityPy 文件句柄，避免 Windows 下缓存文件被锁
     _clear_disk_caches()
     return {"removed": True}
@@ -368,6 +377,7 @@ def _clear_disk_caches():
         shutil.rmtree(containers, ignore_errors=True)
     try:
         SESSION_FILE.unlink(missing_ok=True)
+        KEYPARAMS_FILE.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -770,6 +780,451 @@ def api_character_anim(aid: int, clip: int, textured: bool = False,
         return FileResponse(cache, media_type="model/gltf-binary")
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+
+# ---------- 参数编辑（离线单机 modding，非破坏性：导出到 exports，不覆盖原文件） ----------
+
+_edit_envs: dict[str, object] = {}   # file_path -> 已修改待导出的 UnityPy 环境
+_edit_pending: dict[int, dict] = {}  # aid -> 修改记录
+_edit_lock = threading.Lock()
+
+
+def _get_edit_env(file_path: str):
+    key = os.path.normpath(file_path)
+    with _edit_lock:
+        if key not in _edit_envs:
+            _edit_envs[key] = UnityPy.load(file_path)
+        return _edit_envs[key]
+
+
+def _find_reader(env, meta: dict):
+    for r in env.objects:
+        if r.path_id == meta["path_id"] and \
+                getattr(r.assets_file, "name", "") == meta.get("cab", ""):
+            return r
+    return None
+
+
+def _text_format(text: str) -> str:
+    s = text.lstrip()
+    if s[:1] in ("{", "["):
+        return "JSON"
+    if s[:1] == "<":
+        return "XML"
+    if re.search(r"^\s*\S+\.(png|jpg)\s*$", text, re.M) and "size:" in text:
+        return "Spine 图集"
+    return "纯文本"
+
+
+def _flatten_fields(node, prefix=""):
+    out = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            out.extend(_flatten_fields(v, f"{prefix}.{k}" if prefix else str(k)))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out.extend(_flatten_fields(v, f"{prefix}[{i}]"))
+    else:
+        out.append({"path": prefix, "type": type(node).__name__, "value": node})
+    return out
+
+
+def _coerce(value, old):
+    if isinstance(old, bool):
+        return str(value).lower() in ("true", "1", "yes")
+    if isinstance(old, int):
+        return int(value)
+    if isinstance(old, float):
+        return float(value)
+    return str(value)
+
+
+def _set_by_path(root, path: str, value):
+    tokens = re.findall(r"[^.\[\]]+|\[\d+\]", path)
+    cur = root
+    for i, tok in enumerate(tokens):
+        last = i == len(tokens) - 1
+        if tok.startswith("["):
+            idx = int(tok[1:-1])
+            if last:
+                cur[idx] = _coerce(value, cur[idx])
+            else:
+                cur = cur[idx]
+        else:
+            if last:
+                cur[tok] = _coerce(value, cur[tok])
+            else:
+                cur = cur[tok]
+
+
+@app.get("/api/asset/{aid}/editable")
+def api_asset_editable(aid: int):
+    if aid < 0 or aid >= len(_state["assets"]):
+        raise HTTPException(404, "资源不存在，请先扫描")
+    meta = _state["assets"][aid]
+    t = meta["type"]
+    if t == "TextAsset":
+        _, reader = _get_reader(aid)
+        s = reader.read().m_Script
+        text = s if isinstance(s, str) else s.decode("utf-8", "replace")
+        return {"editable": True, "kind": "text", "name": meta["name"], "text": text,
+                "format": _text_format(text)}
+    if t in ("MonoBehaviour", "ScriptableObject"):
+        _, reader = _get_reader(aid)
+        try:
+            tt = reader.read_typetree()
+        except Exception:
+            return {"editable": False, "kind": "fields", "name": meta["name"],
+                    "reason": "无类型信息（IL2CPP），无法编辑字段"}
+        fields = [{**f, **glossary.explain_field(f["path"], f["type"])} for f in _flatten_fields(tt)]
+        cls = (meta.get("extra") or {}).get("class", "")
+        return {"editable": True, "kind": "fields", "name": meta["name"],
+                "classname": cls, "purpose": glossary.explain_class(cls), "fields": fields}
+    return {"editable": False, "name": meta["name"], "reason": "该类型暂不支持编辑"}
+
+
+class EditReq(BaseModel):
+    text: str | None = None
+    fields: dict | None = None
+
+
+@app.post("/api/asset/{aid}/edit")
+def api_asset_edit(aid: int, req: EditReq):
+    if aid < 0 or aid >= len(_state["assets"]):
+        raise HTTPException(404, "资源不存在，请先扫描")
+    meta = _state["assets"][aid]
+    t = meta["type"]
+    env = _get_edit_env(meta["file_path"])
+    reader = _find_reader(env, meta)
+    if reader is None:
+        raise HTTPException(404, "资源定位失败")
+    try:
+        if t == "TextAsset":
+            if req.text is None:
+                raise HTTPException(400, "缺少文本内容")
+            data = reader.read()
+            data.m_Script = req.text if isinstance(data.m_Script, str) else req.text.encode("utf-8")
+            data.save()
+        elif t in ("MonoBehaviour", "ScriptableObject"):
+            if not req.fields:
+                raise HTTPException(400, "缺少字段修改")
+            tt = reader.read_typetree()
+            for path, val in req.fields.items():
+                _set_by_path(tt, path, val)
+            reader.save_typetree(tt)
+        else:
+            raise HTTPException(400, "该类型暂不支持编辑")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"修改失败: {e}")
+    with _edit_lock:
+        _edit_pending[aid] = {"aid": aid, "name": meta["name"], "type": t, "file": meta["file"]}
+    return {"ok": True, "pending": len(_edit_pending)}
+
+
+@app.get("/api/edit/pending")
+def api_edit_pending():
+    with _edit_lock:
+        return {"total": len(_edit_pending), "items": list(_edit_pending.values())}
+
+
+@app.post("/api/edit/export")
+def api_edit_export():
+    with _edit_lock:
+        if not _edit_envs:
+            raise HTTPException(400, "无待导出的修改")
+        game = "game"
+        if _state["detect"] and _state["detect"].get("root"):
+            game = Path(_state["detect"]["root"]).name
+        out_root = DEFAULT_EXPORT_DIR / "_modified" / _safe_name(game)
+        out_root.mkdir(parents=True, exist_ok=True)
+        written = []
+        for key, env in _edit_envs.items():
+            env.save(pack="none", out_path=str(out_root))
+            written.append(str(out_root / Path(key).name))
+        _edit_envs.clear()
+        _edit_pending.clear()
+    return {"ok": True, "out_dir": str(out_root), "written": written}
+
+
+# ---------- 关键参数一键识别 ----------
+
+KEYPARAMS_FILE = CACHE_DIR / "keyparams.json"
+
+
+def _kp_counts(items: list[dict]):
+    cc: dict[str, int] = {}
+    pc: dict[str, int] = {}
+    for it in items:
+        cc[it["category"]] = cc.get(it["category"], 0) + 1
+        if it.get("priority"):
+            pc[it["priority"]] = pc.get(it["priority"], 0) + 1
+    return cc, pc
+
+
+def _kp_visible(items: list[dict]) -> list[dict]:
+    """查询时按最新引擎类黑名单过滤，使黑名单细化即时生效（无需重扫）。"""
+    return [it for it in items if not glossary.is_engine_class(it.get("class", ""))]
+
+
+def _save_keyparams(items: list[dict]):
+    try:
+        KEYPARAMS_FILE.write_text(json.dumps({"items": items}, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _restore_keyparams():
+    try:
+        d = json.loads(KEYPARAMS_FILE.read_text(encoding="utf-8"))
+        _state["keyparams"] = d.get("items") or []
+    except (OSError, ValueError):
+        _state["keyparams"] = []
+
+
+class KeyParamJob:
+    """按 bundle 分组加载脚本组件，提取分门别类的游戏关键参数（跳过引擎/UI 类）。"""
+
+    def __init__(self, assets: list[dict]):
+        self.assets = assets
+        self.state = "running"
+        self.done_files = 0
+        self.total_files = 0
+        self.items: list[dict] = []
+        self.cat_counts: dict[str, int] = {}
+        self.concept_counts: dict[str, int] = {}
+        self.error: str | None = None
+        self._saved = False
+        self._lock = threading.Lock()
+        self._cancelled = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            self.state = "cancelled"
+
+    def status(self):
+        with self._lock:
+            return {"state": self.state, "done_files": self.done_files,
+                    "total_files": self.total_files, "kept": len(self.items),
+                    "cat_counts": dict(self.cat_counts),
+                    "concept_counts": dict(self.concept_counts), "error": self.error}
+
+    def _run(self):
+        try:
+            by_file: dict[str, list[dict]] = {}
+            for a in self.assets:
+                by_file.setdefault(a["file_path"], []).append(a)
+            with self._lock:
+                self.total_files = len(by_file)
+            for fp, metas in by_file.items():
+                if self._cancelled:
+                    break
+                try:
+                    env = UnityPy.load(fp)
+                except Exception:
+                    with self._lock:
+                        self.done_files += 1
+                    continue
+                readers = {}
+                for r in env.objects:
+                    if r.type.name in ("MonoBehaviour", "ScriptableObject"):
+                        readers[(r.path_id, getattr(r.assets_file, "name", ""))] = r
+                local: list[dict] = []
+                for meta in metas:
+                    if self._cancelled:
+                        break
+                    cls = (meta.get("extra") or {}).get("class", "")
+                    if glossary.is_engine_class(cls):
+                        continue
+                    r = readers.get((meta["path_id"], meta.get("cab", "")))
+                    if r is None:
+                        continue
+                    try:
+                        tt = r.read_typetree()
+                    except Exception:
+                        continue
+                    for f in _flatten_fields(tt):
+                        if f["type"] not in ("int", "float", "bool", "str"):
+                            continue
+                        cat = glossary.categorize_field(f["path"], f["type"])
+                        if not cat:
+                            continue
+                        v = f["value"]
+                        if isinstance(v, float) and not math.isfinite(v):
+                            v = 0.0
+                        ex = glossary.explain_field(f["path"], f["type"])
+                        local.append({
+                            "aid": meta["id"], "name": meta["name"], "class": cls,
+                            "path": f["path"], "type": f["type"], "value": v,
+                            "zh": ex["zh"], "exact": ex["exact"],
+                            "category": cat, "priority": glossary.priority_concept(f["path"], f["type"]),
+                        })
+                with self._lock:
+                    self.items.extend(local)
+                    for it in local:
+                        self.cat_counts[it["category"]] = self.cat_counts.get(it["category"], 0) + 1
+                        if it["priority"]:
+                            self.concept_counts[it["priority"]] = self.concept_counts.get(it["priority"], 0) + 1
+                    self.done_files += 1
+            with self._lock:
+                if not self._cancelled:
+                    self.state = "done"
+        except Exception as e:
+            with self._lock:
+                self.state = "error"
+                self.error = str(e)
+
+
+_restore_keyparams()
+
+
+@app.post("/api/keyparams/scan")
+def api_keyparams_scan():
+    assets = [a for a in _state["assets"] if a["type"] in ("MonoBehaviour", "ScriptableObject")]
+    if not assets:
+        raise HTTPException(400, "请先扫描资源（未发现脚本组件）")
+    old = _state.get("keyparam_job")
+    if old is not None:
+        old.cancel()
+    _state["keyparam_job"] = KeyParamJob(assets)
+    _state["keyparams"] = []
+    return {"started": True, "total_scripts": len(assets)}
+
+
+@app.get("/api/keyparams/status")
+def api_keyparams_status():
+    job: KeyParamJob | None = _state.get("keyparam_job")
+    if job is None:
+        items = _kp_visible(_state.get("keyparams") or [])
+        if items:
+            cc, pc = _kp_counts(items)
+            return {"state": "done", "restored": True, "kept": len(items), "cat_counts": cc,
+                    "concept_counts": pc, "done_files": 0, "total_files": 0, "error": None}
+        return {"state": "idle"}
+    st = job.status()
+    vis = _kp_visible(job.items)
+    cc, pc = _kp_counts(vis)
+    st["kept"] = len(vis); st["cat_counts"] = cc; st["concept_counts"] = pc
+    if st["state"] == "done" and not job._saved:
+        job._saved = True
+        _state["keyparams"] = vis
+        _save_keyparams(vis)
+    return st
+
+
+@app.get("/api/keyparams")
+def api_keyparams(category: str | None = None, priority: str | None = None,
+                  search: str = "", offset: int = 0, limit: int = 200):
+    items = _kp_visible(_state.get("keyparams") or [])
+    for it in items:
+        if "purpose" not in it:
+            it["purpose"] = glossary.explain_class(it.get("class", ""))
+    cc, pc = _kp_counts(items)
+    sel = items
+    if priority == "any":
+        sel = [it for it in sel if it.get("priority")]
+    elif priority:
+        sel = [it for it in sel if it.get("priority") == priority]
+    if category:
+        sel = [it for it in sel if it["category"] == category]
+    if search:
+        s = search.lower()
+        sel = [it for it in sel if s in it["path"].lower() or s in (it["zh"] or "").lower()
+               or s in it["name"].lower() or s in (it["class"] or "").lower()
+               or s in (it.get("purpose") or "").lower()
+               or s in (it.get("priority") or "").lower()]
+    return {"total": len(sel), "items": sel[offset:offset + limit], "cat_counts": cc,
+            "concept_counts": pc, "category_zh": glossary.CATEGORY_ZH,
+            "concepts": [n for n, _ in glossary.PRIORITY_CONCEPTS]}
+
+
+class KeyParamChange(BaseModel):
+    aid: int
+    path: str
+    value: str | int | float | bool
+
+
+class KeyParamSaveReq(BaseModel):
+    changes: list[KeyParamChange]
+
+
+@app.post("/api/keyparams/save")
+def api_keyparams_save(req: KeyParamSaveReq):
+    if not req.changes:
+        raise HTTPException(400, "无修改")
+    by_aid: dict[int, dict] = {}
+    for ch in req.changes:
+        by_aid.setdefault(ch.aid, {})[ch.path] = ch.value
+    applied = 0
+    for aid, fields in by_aid.items():
+        if aid < 0 or aid >= len(_state["assets"]):
+            continue
+        meta = _state["assets"][aid]
+        if meta["type"] not in ("MonoBehaviour", "ScriptableObject"):
+            continue
+        env = _get_edit_env(meta["file_path"])
+        reader = _find_reader(env, meta)
+        if reader is None:
+            continue
+        try:
+            tt = reader.read_typetree()
+            for path, val in fields.items():
+                _set_by_path(tt, path, val)
+            reader.save_typetree(tt)
+        except Exception as e:
+            raise HTTPException(500, f"修改失败（{meta['name']}）: {e}")
+        with _edit_lock:
+            _edit_pending[aid] = {"aid": aid, "name": meta["name"], "type": meta["type"], "file": meta["file"]}
+        applied += 1
+    changed = {(ch.aid, ch.path): ch.value for ch in req.changes}
+    items = _state.get("keyparams") or []
+    for it in items:
+        k = (it["aid"], it["path"])
+        if k in changed:
+            it["value"] = _coerce(changed[k], it["value"])
+    if applied:
+        _save_keyparams(items)
+    return {"ok": True, "applied": applied, "pending": len(_edit_pending)}
+
+
+# ---------- 在线翻译（百度/有道，按需+缓存） ----------
+
+class TranslateConfigReq(BaseModel):
+    provider: str = "baidu"
+    appid: str = ""
+    key: str = ""
+
+
+@app.get("/api/translate/config")
+def api_translate_config():
+    return translate.get_config()
+
+
+@app.post("/api/translate/config")
+def api_translate_config_save(req: TranslateConfigReq):
+    translate.save_config(req.provider, req.appid, req.key)
+    return translate.get_config()
+
+
+class TranslateReq(BaseModel):
+    texts: list[str]
+    src: str = "auto"
+
+
+@app.post("/api/translate")
+def api_translate(req: TranslateReq):
+    if not req.texts:
+        return {"results": {}}
+    try:
+        res = translate.translate_batch(req.texts[:500], req.src)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"翻译请求失败: {e}")
+    return {"results": res, "provider": translate.get_config()["provider"]}
 
 
 # ---------- 导出 ----------

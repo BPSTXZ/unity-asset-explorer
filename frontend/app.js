@@ -10,9 +10,11 @@ const TYPE_ZH = {
   Character: '角色', Mesh: '模型', Texture2D: '贴图', Sprite: '精灵图', AnimationClip: '动画片段',
   AudioClip: '音频片段', Material: '材质', Shader: '着色器', TextAsset: '文本资源',
   Font: '字体', Cubemap: '立方体贴图', VideoClip: '视频片段',
+  MonoBehaviour: '脚本组件', ScriptableObject: '配置对象',
 };
 const zh = (t) => TYPE_ZH[t] || t;
 const IMAGE_TYPES = ['Texture2D', 'Sprite', 'Cubemap'];
+const EDITABLE_TYPES = ['TextAsset', 'MonoBehaviour', 'ScriptableObject'];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -189,6 +191,7 @@ function pollScan() {
   state.scanTimer = setTimeout(async () => {
     const st = await (await api('/api/scan/status')).json();
     $('btnGallery').disabled = !st.asset_count;
+    $('btnKp').disabled = !st.asset_count;
     const pct = st.total_files ? Math.round(st.done_files / st.total_files * 100) : 0;
     const p = $('scanProgress');
     p.querySelector('.bar').style.width = pct + '%';
@@ -250,7 +253,9 @@ function resetProjectUI() {
   $('btnScan').disabled = true;
   $('btnExportAll').disabled = true;
   $('btnGallery').disabled = true;
+  $('btnKp').disabled = true;
   closeGallery();
+  closeKp();
   $('searchInput').value = '';
   $('checkAll').checked = false;
   for (const id of ['thName', 'thSize']) $(id).querySelector('.arrow').textContent = '';
@@ -315,6 +320,7 @@ function applyFavList() {
 function extraText(a) {
   const e = a.extra || {};
   if (e.parts) return `${e.parts} 部件 · ${e.bones} 骨骼`;
+  if (e.class) return e.class;
   if (e.width) return `${e.width}×${e.height}`;
   if (e.vertices) return `${e.vertices} 顶点`;
   if (e.length) return `${Number(e.length).toFixed(1)}s`;
@@ -416,7 +422,8 @@ document.addEventListener('keydown', (e) => {
   if (t && (t.isContentEditable || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' ||
       (t.tagName === 'INPUT' && t.type !== 'checkbox'))) return;
   if (!$('folderDialog').classList.contains('hidden') || !$('exportDialog').classList.contains('hidden') ||
-      !$('favDialog').classList.contains('hidden') || !$('galleryOverlay').classList.contains('hidden')) return;
+      !$('favDialog').classList.contains('hidden') || !$('galleryOverlay').classList.contains('hidden') ||
+      !$('editDialog').classList.contains('hidden')) return;
   e.preventDefault();
   navigateList(e.key === 'ArrowDown' ? 1 : -1);
 });
@@ -1005,6 +1012,12 @@ async function showPreview(a) {
     (a.container ? `<br>容器：${a.container}` : '') +
     `<br>PathID：${a.path_id}` + (extraText(a) ? ` · ${extraText(a)}` : '');
   setPreviewActions(a);
+  if (EDITABLE_TYPES.includes(a.type)) {
+    const b = document.createElement('button');
+    b.className = 'btn small primary'; b.textContent = '编辑参数';
+    b.onclick = () => openEditor(a);
+    $('previewActions').insertBefore(b, $('previewActions').firstChild);
+  }
   $('previewBody').innerHTML = '<div class="spinner">加载中…</div>';
   try {
     if (a.type === 'Mesh' || a.type === 'Character') return await showMeshPreview(a, token);
@@ -1094,6 +1107,111 @@ function pollExport() {
 
 $('pathInput').addEventListener('keydown', e => { if (e.key === 'Enter') doDetect(); });
 
+// ---------------- 参数编辑 ----------------
+const editor = { aid: null, kind: null, fields: [], changed: {}, classname: '', purpose: '' };
+async function openEditor(a) {
+  editor.aid = a.id; editor.kind = null; editor.fields = []; editor.changed = {};
+  $('editName').textContent = `${a.name}（${zh(a.type)}）`;
+  $('editBody').innerHTML = '<div class="spinner">加载中…</div>';
+  $('editApply').disabled = true;
+  $('editDialog').classList.remove('hidden');
+  refreshPending();
+  try {
+    const d = await (await api(`/api/asset/${a.id}/editable`)).json();
+    editor.kind = d.kind;
+    if (!d.editable) {
+      $('editBody').innerHTML = `<div class="edit-na">${esc(d.reason || '不可编辑')}</div>`;
+      return;
+    }
+    $('editApply').disabled = false;
+    if (d.kind === 'text') {
+      $('editBody').innerHTML = `<div class="edit-fmt">文本格式：<b>${esc(d.format || '纯文本')}</b>　直接编辑下方内容，保存后导出。</div><textarea id="editText" class="edit-text" spellcheck="false"></textarea>`;
+      $('editText').value = d.text;
+    } else {
+      editor.fields = d.fields || [];
+      editor.classname = d.classname || '';
+      editor.purpose = d.purpose || '';
+      $('editBody').innerHTML = '<div id="editBanner"></div>'
+        + '<div class="field-hint">释义为自动翻译；<em class="f-guess">推测</em> 按字段名推断，<em class="f-online">在线</em> 为机器翻译，仅供参考。可搜索路径或释义。</div>'
+        + '<input id="fieldSearch" class="field-search" type="text" placeholder="搜索字段路径或中文释义…"><div id="fieldTable" class="field-table"></div>';
+      renderEditorBanner();
+      $('fieldSearch').oninput = renderFieldRows;
+      renderFieldRows();
+    }
+  } catch (e) {
+    $('editBody').innerHTML = `<div class="edit-na">加载失败：${esc(e.message)}</div>`;
+  }
+}
+function renderEditorBanner() {
+  const el = $('editBanner'); if (!el) return;
+  const cls = editor.classname, off = editor.purpose, on = cls ? onlineTr[cls] : '';
+  if (!cls && !off) { el.innerHTML = ''; return; }
+  const text = on || off;
+  el.innerHTML = `<div class="edit-purpose"><span class="ep-label">${text ? '脚本用处' : '脚本'}</span>`
+    + (text ? `<span class="ep-text">${esc(text)}${on ? '<em class="f-online">在线</em>' : ''}</span>` : '')
+    + (cls ? `<code class="ep-class">${esc(cls)}</code>` : '') + `</div>`;
+}
+function renderFieldRows() {
+  const q = ($('fieldSearch')?.value || '').toLowerCase();
+  const rows = editor.fields.filter(f => !q || f.path.toLowerCase().includes(q)
+    || (f.zh || '').toLowerCase().includes(q) || (onlineTr[f.name] || '').toLowerCase().includes(q)).slice(0, 500);
+  const tbl = $('fieldTable');
+  tbl.innerHTML = '<div class="field-head"><span>字段 / 释义</span><span>类型</span><span>值</span></div>';
+  if (!rows.length) { tbl.innerHTML += '<div class="edit-na">无匹配字段</div>'; return; }
+  const frag = document.createDocumentFragment();
+  for (const f of rows) {
+    const row = document.createElement('div');
+    row.className = 'field-row';
+    const on = onlineTr[f.name];
+    const zhText = on || f.zh;
+    const badge = on ? '<em class="f-online">在线</em>' : (f.exact ? '' : '<em class="f-guess">推测</em>');
+    const zh = zhText ? `<span class="f-zh">${esc(zhText)}${badge}</span>` : '';
+    row.innerHTML = `<span class="f-path"><span class="f-key" title="${esc(f.path)}">${esc(f.path)}</span>${zh}</span><span class="f-type">${esc(f.type)}</span>`;
+    const inp = document.createElement('input');
+    inp.className = 'f-val';
+    if (f.type === 'bool') { inp.type = 'checkbox'; inp.checked = !!f.value; }
+    else { inp.type = (f.type === 'int' || f.type === 'float') ? 'number' : 'text'; inp.value = f.value; }
+    if (editor.changed[f.path] !== undefined) {
+      if (inp.type === 'checkbox') inp.checked = !!editor.changed[f.path];
+      else inp.value = editor.changed[f.path];
+    }
+    inp.onchange = () => { editor.changed[f.path] = inp.type === 'checkbox' ? inp.checked : inp.value; };
+    row.appendChild(inp);
+    frag.appendChild(row);
+  }
+  tbl.appendChild(frag);
+}
+async function refreshPending() {
+  try {
+    const d = await (await api('/api/edit/pending')).json();
+    $('editPending').textContent = d.total ? `待导出 ${d.total} 项` : '';
+    $('editExport').disabled = !d.total;
+  } catch {}
+}
+$('editApply').onclick = async () => {
+  const body = {};
+  if (editor.kind === 'text') body.text = $('editText').value;
+  else {
+    if (!Object.keys(editor.changed).length) return toast('尚未修改任何字段', true);
+    body.fields = editor.changed;
+  }
+  try {
+    await postJson(`/api/asset/${editor.aid}/edit`, body);
+    editor.changed = {};
+    toast('已保存修改（待导出）');
+    refreshPending();
+  } catch (e) { toast(e.message, true); }
+};
+$('editExport').onclick = async () => {
+  try {
+    const r = await (await postJson('/api/edit/export', {})).json();
+    toast(`已导出 ${r.written.length} 个 bundle → ${r.out_dir}`);
+    refreshPending();
+  } catch (e) { toast(e.message, true); }
+};
+$('editClose').onclick = () => $('editDialog').classList.add('hidden');
+$('editDialog').addEventListener('click', e => { if (e.target === $('editDialog')) $('editDialog').classList.add('hidden'); });
+
 // ---------------- CG 画廊 ----------------
 const gallery = {
   open: false, items: [], total: 0, page: 0, pageSize: 60,
@@ -1156,6 +1274,241 @@ let gallerySearchTimer;
 $('gallerySearch').oninput = (e) => {
   clearTimeout(gallerySearchTimer);
   gallerySearchTimer = setTimeout(() => { gallery.search = e.target.value.trim(); gallery.page = 0; loadGallery(); }, 300);
+};
+
+// ---------------- 关键参数一键识别 ----------------
+const kp = {
+  open: false, tab: 'priority', concept: '', search: '', page: 0, pageSize: 200,
+  items: [], total: 0, catCounts: {}, conceptCounts: {}, concepts: [], categoryZh: {},
+  changed: {}, scanning: false, scanTimer: null,
+};
+async function openKp() {
+  kp.open = true;
+  $('kpOverlay').classList.remove('hidden');
+  refreshKpPending();
+  try {
+    const st = await (await api('/api/keyparams/status')).json();
+    if (st.state === 'idle') return kpScan();
+    if (st.state === 'running') { kp.scanning = true; $('kpScan').disabled = true; $('kpScan').textContent = '识别中…'; return pollKp(); }
+    applyKpCounts(st); loadKp();
+  } catch (e) { toast(e.message, true); }
+}
+function closeKp() {
+  kp.open = false; clearTimeout(kp.scanTimer);
+  $('kpOverlay').classList.add('hidden');
+}
+async function kpScan() {
+  try {
+    await postJson('/api/keyparams/scan', {});
+    kp.scanning = true; kp.changed = {}; kp.page = 0;
+    $('kpScan').disabled = true; $('kpScan').textContent = '识别中…';
+    $('kpSave').disabled = true; $('kpSave').textContent = '保存修改';
+    pollKp();
+  } catch (e) { toast(e.message, true); }
+}
+function pollKp() {
+  clearTimeout(kp.scanTimer);
+  kp.scanTimer = setTimeout(async () => {
+    const st = await (await api('/api/keyparams/status')).json();
+    $('kpProgress').textContent = `识别中 ${st.done_files}/${st.total_files} · ${st.kept} 项`;
+    if (st.state === 'running') return pollKp();
+    kp.scanning = false;
+    $('kpScan').disabled = false; $('kpScan').textContent = '重新识别';
+    $('kpProgress').textContent = '';
+    if (st.state === 'error') return toast('识别出错: ' + st.error, true);
+    applyKpCounts(st); loadKp();
+    toast(`识别完成 · ${st.kept} 项关键参数`);
+  }, 300);
+}
+function applyKpCounts(st) {
+  kp.catCounts = st.cat_counts || {};
+  kp.conceptCounts = st.concept_counts || {};
+}
+async function loadKp() {
+  const params = new URLSearchParams({ search: kp.search, offset: kp.page * kp.pageSize, limit: kp.pageSize });
+  if (kp.tab === 'priority') params.set('priority', kp.concept || 'any');
+  else if (kp.tab !== 'all') params.set('category', kp.tab);
+  const d = await (await api('/api/keyparams?' + params)).json();
+  kp.items = d.items; kp.total = d.total;
+  kp.categoryZh = d.category_zh; kp.concepts = d.concepts;
+  kp.catCounts = d.cat_counts; kp.conceptCounts = d.concept_counts;
+  renderKpTabs(); renderKpConcepts(); renderKpList();
+}
+function renderKpTabs() {
+  const priTotal = Object.values(kp.conceptCounts).reduce((a, b) => a + b, 0);
+  const allTotal = Object.values(kp.catCounts).reduce((a, b) => a + b, 0);
+  let html = `<button class="kp-tab${kp.tab === 'priority' ? ' active' : ''}" data-tab="priority">重点参数 <b>${priTotal}</b></button>`;
+  for (const [k, zh] of Object.entries(kp.categoryZh)) {
+    html += `<button class="kp-tab${kp.tab === k ? ' active' : ''}" data-tab="${k}">${esc(zh)} <b>${kp.catCounts[k] || 0}</b></button>`;
+  }
+  html += `<button class="kp-tab${kp.tab === 'all' ? ' active' : ''}" data-tab="all">全部 <b>${allTotal}</b></button>`;
+  const tabs = $('kpTabs'); tabs.innerHTML = html;
+  tabs.querySelectorAll('.kp-tab').forEach(b => b.onclick = () => { kp.tab = b.dataset.tab; kp.concept = ''; kp.page = 0; loadKp(); });
+}
+function renderKpConcepts() {
+  const el = $('kpConcepts');
+  if (kp.tab !== 'priority') { el.classList.add('hidden'); el.innerHTML = ''; return; }
+  el.classList.remove('hidden');
+  let html = `<button class="kp-chip${kp.concept === '' ? ' active' : ''}" data-c="">全部重点</button>`;
+  for (const c of kp.concepts) {
+    const n = kp.conceptCounts[c] || 0;
+    html += `<button class="kp-chip${kp.concept === c ? ' active' : ''}${n ? '' : ' empty'}" data-c="${esc(c)}"${n ? '' : ' disabled'}>${esc(c)} <b>${n}</b></button>`;
+  }
+  el.innerHTML = html;
+  el.querySelectorAll('.kp-chip').forEach(b => b.onclick = () => { kp.concept = b.dataset.c; kp.page = 0; loadKp(); });
+}
+function renderKpList() {
+  const list = $('kpList');
+  const pages = Math.max(1, Math.ceil(kp.total / kp.pageSize));
+  kp.page = Math.min(kp.page, pages - 1);
+  $('kpCount').textContent = `${kp.total} 项`;
+  $('kpPage').textContent = `${kp.page + 1} / ${pages}`;
+  $('kpPrev').disabled = kp.page === 0;
+  $('kpNext').disabled = kp.page >= pages - 1;
+  const nChanged = Object.keys(kp.changed).length;
+  $('kpSave').disabled = !nChanged;
+  $('kpSave').textContent = nChanged ? `保存修改 (${nChanged})` : '保存修改';
+  list.innerHTML = '';
+  if (!kp.items.length) {
+    list.innerHTML = '<div class="kp-empty">无匹配参数。点击「一键识别」扫描脚本组件，或调整筛选 / 搜索。</div>';
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const it of kp.items) {
+    const key = it.aid + '|' + it.path;
+    const row = document.createElement('div');
+    row.className = 'kp-row'; row.dataset.key = key;
+    const badge = it.priority ? `<span class="kp-badge">${esc(it.priority)}</span>` : '';
+    const leaf = it.path.split('.').pop().replace(/\[\d+\]/g, '');
+    const on = onlineTr[leaf];
+    const zhText = on || it.zh;
+    const zbadge = on ? '<em class="f-online">在线</em>' : (it.zh && !it.exact ? '<em class="f-guess">推测</em>' : '');
+    const zh = zhText ? `<span class="kp-zh">${esc(zhText)}${zbadge}</span>` : '';
+    const cls = it.class || '';
+    const clsOn = cls ? onlineTr[cls] : '';
+    const purpose = clsOn || it.purpose || '';
+    const pbadge = clsOn ? '<em class="f-online">在线</em>' : (purpose ? '<em class="f-guess">推测</em>' : '');
+    const purposeHtml = purpose ? `<span class="kp-szh" title="${esc(purpose)}">${esc(purpose)}${pbadge}</span>` : '';
+    const classHtml = (cls && cls !== it.name) ? `<span class="kp-sclass">${esc(cls)}</span>` : '';
+    row.innerHTML = `<div class="kp-script" title="${esc(cls)}"><span class="kp-sname">${esc(it.name)}</span>${purposeHtml}${classHtml}</div>`
+      + `<div class="kp-field"><span class="kp-keyline">${badge}<span class="kp-key" title="${esc(it.path)}">${esc(it.path)}</span></span>${zh}</div>`;
+    const inp = document.createElement('input');
+    inp.className = 'kp-val';
+    const cur = kp.changed[key] ? kp.changed[key].value : it.value;
+    if (it.type === 'bool') { inp.type = 'checkbox'; inp.checked = !!cur; }
+    else { inp.type = (it.type === 'int' || it.type === 'float') ? 'number' : 'text'; inp.value = cur; }
+    if (kp.changed[key]) row.classList.add('dirty');
+    inp.onchange = () => {
+      kp.changed[key] = { aid: it.aid, path: it.path, value: inp.type === 'checkbox' ? inp.checked : inp.value };
+      row.classList.add('dirty');
+      const n = Object.keys(kp.changed).length;
+      $('kpSave').disabled = false; $('kpSave').textContent = `保存修改 (${n})`;
+    };
+    row.appendChild(inp);
+    frag.appendChild(row);
+  }
+  list.appendChild(frag);
+  list.scrollTop = 0;
+}
+async function kpSave() {
+  const changes = Object.values(kp.changed);
+  if (!changes.length) return toast('尚未修改任何参数', true);
+  try {
+    const r = await (await postJson('/api/keyparams/save', { changes })).json();
+    kp.changed = {};
+    toast(`已保存 ${r.applied} 个脚本的修改（待导出）`);
+    refreshKpPending(); loadKp();
+  } catch (e) { toast(e.message, true); }
+}
+async function kpExport() {
+  try {
+    const r = await (await postJson('/api/edit/export', {})).json();
+    toast(`已导出 ${r.written.length} 个 bundle → ${r.out_dir}`);
+    refreshKpPending();
+  } catch (e) { toast(e.message, true); }
+}
+async function refreshKpPending() {
+  try {
+    const d = await (await api('/api/edit/pending')).json();
+    $('kpPending').textContent = d.total ? `待导出 ${d.total} 项` : '';
+    $('kpExport').disabled = !d.total;
+  } catch {}
+}
+$('btnKp').onclick = openKp;
+$('kpClose').onclick = closeKp;
+$('kpScan').onclick = kpScan;
+$('kpSave').onclick = kpSave;
+$('kpExport').onclick = kpExport;
+$('kpPrev').onclick = () => { kp.page--; loadKp(); };
+$('kpNext').onclick = () => { kp.page++; loadKp(); };
+let kpSearchTimer;
+$('kpSearch').oninput = (e) => {
+  clearTimeout(kpSearchTimer);
+  kpSearchTimer = setTimeout(() => { kp.search = e.target.value.trim(); kp.page = 0; loadKp(); }, 300);
+};
+
+// ---------------- 在线翻译（百度/有道，按需+缓存） ----------------
+const onlineTr = {};
+async function openTrSettings() {
+  try {
+    const c = await (await api('/api/translate/config')).json();
+    $('trProvider').value = c.provider || 'baidu';
+    $('trAppid').value = c.appid || '';
+    $('trKey').value = '';
+    $('trKey').placeholder = c.has_key ? '已保存（留空则不修改）' : '百度密钥 / 有道应用密钥';
+    $('trStatus').textContent = c.configured ? `已配置 · 缓存 ${c.cached} 条` : '未配置';
+    $('translateDialog').classList.remove('hidden');
+  } catch (e) { toast(e.message, true); }
+}
+$('trSave').onclick = async () => {
+  const provider = $('trProvider').value, appid = $('trAppid').value.trim();
+  let key = $('trKey').value.trim();
+  if (!appid) return toast('请填写 AppID', true);
+  try {
+    const cur = await (await api('/api/translate/config')).json();
+    if (!key && cur.has_key && cur.appid === appid) {
+      // 留空且 appid 未变：仅切换服务商，保留原密钥
+      const c = await (await postJson('/api/translate/config', { provider, appid, key: '__KEEP__' })).json();
+      $('trStatus').textContent = c.configured ? `已配置 · 缓存 ${c.cached} 条` : '未配置';
+      toast('翻译设置已保存'); $('translateDialog').classList.add('hidden');
+      return;
+    }
+    if (!key) return toast('请填写密钥', true);
+    const c = await (await postJson('/api/translate/config', { provider, appid, key })).json();
+    $('trStatus').textContent = c.configured ? `已配置 · 缓存 ${c.cached} 条` : '未配置';
+    toast('翻译设置已保存'); $('translateDialog').classList.add('hidden');
+  } catch (e) { toast(e.message, true); }
+};
+$('trClose').onclick = () => $('translateDialog').classList.add('hidden');
+$('translateDialog').addEventListener('click', e => { if (e.target === $('translateDialog')) $('translateDialog').classList.add('hidden'); });
+$('kpTrCfg').onclick = openTrSettings;
+$('editTrCfg').onclick = openTrSettings;
+
+async function doTranslate(names, onDone) {
+  let cfg;
+  try { cfg = await (await api('/api/translate/config')).json(); }
+  catch (e) { return toast(e.message, true); }
+  if (!cfg.configured) { openTrSettings(); return toast('请先配置在线翻译 API', true); }
+  const uniq = [...new Set(names.filter(Boolean))];
+  if (!uniq.length) return toast('无可翻译内容', true);
+  const btns = [$('editTranslate'), $('kpTranslate')];
+  btns.forEach(b => { if (b) { b.disabled = true; b.dataset.old = b.textContent; b.textContent = '翻译中…'; } });
+  try {
+    const r = await (await postJson('/api/translate', { texts: uniq })).json();
+    Object.assign(onlineTr, r.results);
+    toast(`在线翻译 ${Object.keys(r.results).length} 项（${r.provider}）`);
+    if (onDone) onDone();
+  } catch (e) { toast(e.message, true); }
+  finally { btns.forEach(b => { if (b) { b.disabled = false; b.textContent = b.dataset.old || '在线翻译'; } }); }
+}
+$('editTranslate').onclick = () => {
+  if (editor.kind !== 'fields') return toast('文本资源请直接编辑内容', true);
+  doTranslate([editor.classname, ...editor.fields.map(f => f.name)], () => { renderEditorBanner(); renderFieldRows(); });
+};
+$('kpTranslate').onclick = () => {
+  const names = [];
+  for (const it of kp.items) { names.push(it.class); names.push(it.path.split('.').pop().replace(/\[\d+\]/g, '')); }
+  doTranslate(names, () => renderKpList());
 };
 
 // ---------------- 全屏灯箱 ----------------
@@ -1255,7 +1608,7 @@ document.addEventListener('keydown', (e) => {
     const st = await (await api('/api/scan/status')).json();
     if (st.state === 'idle') return;
     $('scanProgress').classList.remove('hidden');
-    if (st.asset_count) { renderTypeList(st.type_counts); loadAssets(); $('btnExportAll').disabled = false; $('btnGallery').disabled = false; }
+    if (st.asset_count) { renderTypeList(st.type_counts); loadAssets(); $('btnExportAll').disabled = false; $('btnGallery').disabled = false; $('btnKp').disabled = false; }
     if (st.state === 'running') { $('btnScan').disabled = true; pollScan(); }
     else $('scanProgress').querySelector('.label').textContent = `完成 · ${st.asset_count} 资源`;
   } catch {}
