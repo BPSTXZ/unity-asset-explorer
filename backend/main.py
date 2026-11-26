@@ -158,6 +158,37 @@ if _state["scan_path"] and _find_project(_state["scan_path"]) is None:
                     scan_state="done" if _state["assets"] else "idle",
                     asset_count=len(_state["assets"]))
 
+# ---------- 按项目清单缓存（切换项目免重扫，除非用户移除） ----------
+MANIFEST_DIR = CACHE_DIR / "manifests"
+MANIFEST_DIR.mkdir(exist_ok=True)
+
+
+def _manifest_file(path: str) -> Path:
+    return MANIFEST_DIR / (hashlib.md5(_norm_path(path).encode("utf-8")).hexdigest()[:16] + ".json")
+
+
+def _save_manifest():
+    if not _state["scan_path"] or not _state["assets"]:
+        return
+    try:
+        counts: dict[str, int] = {}
+        for a in _state["assets"]:
+            counts[a["type"]] = counts.get(a["type"], 0) + 1
+        _manifest_file(_state["scan_path"]).write_text(json.dumps({
+            "detect": _state["detect"], "scan_path": _state["scan_path"],
+            "assets": _state["assets"], "type_counts": counts,
+            "saved_at": time.time()}, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _load_manifest(path: str) -> dict | None:
+    try:
+        return json.loads(_manifest_file(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 # ---------- 收藏（别名仅用于个人辨识，与原命名分离，不参与任何解析/导出） ----------
 FAVORITES_FILE = CACHE_DIR / "favorites.json"
 _favorites: list[dict] = []
@@ -409,6 +440,7 @@ def api_scan_status():
     if st["state"] == "done" and not getattr(job, "_session_saved", False):
         job._session_saved = True
         _save_session()
+        _save_manifest()
     return st
 
 
@@ -430,10 +462,21 @@ def api_scan_resume():
     return {"state": job.state}
 
 
-@app.post("/api/project/remove")
-def api_project_remove():
-    """移除当前项目：停止后台任务、清空清单与解析缓存以释放内存（收藏保留）。"""
-    path = _state["scan_path"] or (_state["detect"] or {}).get("root")
+def _clear_preview_caches():
+    """预览 PNG/GLB/缩略图按 aid 命名，跨项目会串，切换/移除时清理。"""
+    try:
+        for p in CACHE_DIR.glob("*.png"):
+            p.unlink(missing_ok=True)
+        for p in CACHE_DIR.glob("*.glb"):
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
+    shutil.rmtree(CACHE_DIR / "thumbs", ignore_errors=True)
+    (CACHE_DIR / "thumbs").mkdir(exist_ok=True)
+
+
+def _release_current():
+    """停止当前项目后台任务并释放内存/编辑态，但保留各项目磁盘缓存与历史。"""
     for key in ("scan", "export", "keyparam_job"):
         job = _state.get(key)
         if job is not None:
@@ -447,35 +490,69 @@ def api_project_remove():
     with _edit_lock:
         _edit_envs.clear()
         _edit_pending.clear()
-    _state.update(detect=None, scan=None, scan_path=None, assets=[], export=None,
-                  keyparam_job=None, keyparams=[])
-    gc.collect()  # 先释放 UnityPy 文件句柄，避免 Windows 下缓存文件被锁
-    _clear_disk_caches()
+    _state.update(scan=None, export=None, keyparam_job=None, keyparams=[])
+    try:
+        KEYPARAMS_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _clear_preview_caches()
+    gc.collect()
+
+
+@app.post("/api/project/remove")
+def api_project_remove():
+    """移除当前项目：停止任务、清清单与该项目缓存（manifest/容器），保留其它项目与收藏。"""
+    path = _state["scan_path"] or (_state["detect"] or {}).get("root")
+    det = _state["detect"]
+    _release_current()
+    _state.update(detect=None, scan_path=None, assets=[])
+    _clear_disk_caches(det)
+    if path:
+        _manifest_file(path).unlink(missing_ok=True)
     _forget_project(path)
     return {"removed": True}
 
 
-def _clear_disk_caches():
-    """删除可再生缓存：预览 PNG/GLB、缩略图、解包容器；保留收藏。"""
-    try:
-        for p in CACHE_DIR.glob("*.png"):
-            p.unlink(missing_ok=True)
-        for p in CACHE_DIR.glob("*.glb"):
-            p.unlink(missing_ok=True)
-    except OSError:
-        pass
-    shutil.rmtree(CACHE_DIR / "thumbs", ignore_errors=True)
-    (CACHE_DIR / "thumbs").mkdir(exist_ok=True)
+def _clear_disk_caches(det=None):
+    """删除可再生缓存：预览/缩略图、解包容器（按项目 scoped）、会话；保留收藏与其它项目。"""
+    _clear_preview_caches()
     containers = CACHE_DIR / "containers"
-    shutil.rmtree(containers, ignore_errors=True)
-    if containers.exists():  # 句柄延迟释放时重试
-        gc.collect()
+    if det and det.get("container_files"):
+        for c in det["container_files"]:
+            shutil.rmtree(containers / Path(c).stem, ignore_errors=True)
+    else:
         shutil.rmtree(containers, ignore_errors=True)
+        if containers.exists():  # 句柄延迟释放时重试
+            gc.collect()
+            shutil.rmtree(containers, ignore_errors=True)
     try:
         SESSION_FILE.unlink(missing_ok=True)
         KEYPARAMS_FILE.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+@app.post("/api/project/open")
+def api_project_open(req: PathReq):
+    """打开项目：有清单缓存则即时恢复（免重扫），否则 restored=False 走识别+扫描。"""
+    path = req.path.strip().strip('"')
+    key = _norm_path(path)
+    cur = _state["scan_path"]
+    if cur and _norm_path(cur) == key and _state["assets"]:
+        return {"restored": True, "already": True, "asset_count": len(_state["assets"])}
+    mf = _load_manifest(path)
+    if mf and mf.get("assets"):
+        _release_current()
+        _state["detect"] = mf.get("detect")
+        _state["scan_path"] = mf.get("scan_path") or path
+        _state["assets"] = mf.get("assets") or []
+        _upsert_project(_state["scan_path"], scan_state="done", asset_count=len(_state["assets"]))
+        _save_session()
+        return {"restored": True, "asset_count": len(_state["assets"])}
+    if cur and _norm_path(cur) != key:
+        _release_current()
+        _state.update(detect=None, scan_path=None, assets=[])
+    return {"restored": False}
 
 
 @app.get("/api/session")
@@ -786,12 +863,57 @@ def _creature_dir(file_path: str) -> str:
     return ""
 
 
+# ---------- 动画手动绑定 + 匹配结果缓存（避免每次重扫匹配） ----------
+CLIPMATCH_DIR = CACHE_DIR / "clipmatch"
+CLIPMATCH_DIR.mkdir(exist_ok=True)
+BINDS_FILE = CACHE_DIR / "char_binds.json"
+_binds: dict[str, list] = {}
+_binds_lock = threading.Lock()
+
+
+def _load_binds():
+    global _binds
+    try:
+        _binds = json.loads(BINDS_FILE.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        _binds = {}
+
+
+def _save_binds():
+    try:
+        BINDS_FILE.write_text(json.dumps(_binds, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+_load_binds()
+
+
+def _clipmatch_file(key: str) -> Path:
+    return CLIPMATCH_DIR / (hashlib.md5(key.encode("utf-8")).hexdigest()[:16] + ".json")
+
+
+def _resolve_clips(entries: list) -> list:
+    """把稳定键解析回当前会话 aid（重扫/切换后 aid 会变）。"""
+    index = {_asset_key(a): a for a in _state["assets"]}
+    out = []
+    for e in entries:
+        a = index.get(e.get("key", ""))
+        if a is None:
+            continue
+        d = dict(e)
+        d["id"] = a["id"]
+        out.append(d)
+    return out
+
+
 class ClipMatchJob:
     """后台扫描与角色骨骼兼容的动画 clips（按骨骼路径 CRC 匹配打分）。"""
 
-    def __init__(self, char_crc: set, boost_dir: str):
+    def __init__(self, char_crc: set, boost_dir: str, char_key: str = ""):
         self.char_crc = char_crc
         self.boost_dir = boost_dir
+        self.char_key = char_key
         self.state = "running"
         self.done = 0
         self.total = 0
@@ -845,6 +967,7 @@ class ClipMatchJob:
                         dur = getattr(mc, "m_StopTime", 0) if mc else 0
                         matched.append({
                             "id": a["id"], "name": a["name"], "file": a["file"],
+                            "key": _asset_key(a),
                             "ratio": round(ratio, 3), "bones": hit,
                             "duration": round(dur, 3), "boost": boost,
                         })
@@ -856,6 +979,12 @@ class ClipMatchJob:
                 self.results = matched
             if not self._cancelled:
                 self.state = "done"
+                if self.char_key:
+                    try:
+                        _clipmatch_file(self.char_key).write_text(
+                            json.dumps({"results": matched}, ensure_ascii=False), encoding="utf-8")
+                    except OSError:
+                        pass
         except Exception as e:
             if not self._cancelled:
                 self.state = "error"
@@ -876,12 +1005,52 @@ def api_character_clips(aid: int, refresh: bool = False):
     meta, reader = _get_reader(aid)
     if meta["type"] != "Character":
         raise HTTPException(400, "非角色资源")
+    ckey = _asset_key(meta)
+    if not refresh:
+        try:
+            cached = json.loads(_clipmatch_file(ckey).read_text(encoding="utf-8")).get("results")
+        except (OSError, ValueError):
+            cached = None
+        if cached is not None:
+            res = _resolve_clips(cached)
+            return {"state": "done", "done": 0, "total": 0, "count": len(res),
+                    "error": None, "results": res, "cached": True}
     job = _clip_jobs.get(aid)
     if job is None or refresh:
         crc = character_bone_crc(reader)
-        job = ClipMatchJob(crc, _creature_dir(meta["file_path"]))
+        job = ClipMatchJob(crc, _creature_dir(meta["file_path"]), ckey)
         _clip_jobs[aid] = job
     return job.status()
+
+
+class BindReq(BaseModel):
+    clip: int
+    remove: bool = False
+
+
+@app.get("/api/character_binds/{aid}")
+def api_character_binds(aid: int):
+    meta, _ = _get_reader(aid)
+    with _binds_lock:
+        entries = list(_binds.get(_asset_key(meta), []))
+    return {"binds": _resolve_clips(entries)}
+
+
+@app.post("/api/character_binds/{aid}")
+def api_character_bind(aid: int, req: BindReq):
+    """手动绑定/解绑动画到角色（持久化，跨会话按稳定键解析）。"""
+    meta, _ = _get_reader(aid)
+    cmeta, _ = _get_reader(req.clip)
+    ck, ek = _asset_key(meta), _asset_key(cmeta)
+    with _binds_lock:
+        lst = _binds.setdefault(ck, [])
+        if req.remove:
+            lst[:] = [e for e in lst if e.get("key") != ek]
+        elif not any(e.get("key") == ek for e in lst):
+            lst.append({"key": ek, "name": cmeta["name"], "file": cmeta["file"]})
+        _save_binds()
+        entries = list(lst)
+    return {"binds": _resolve_clips(entries)}
 
 
 @app.get("/api/character_anim/{aid}")

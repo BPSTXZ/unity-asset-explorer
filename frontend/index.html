@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Asset Explorer · 游戏资源提取</title>
-<link rel="stylesheet" href="/style.css?v=18">
+<link rel="stylesheet" href="/style.css?v=21">
 <script type="importmap">
 {
   "imports": {
@@ -51,6 +51,7 @@
   <section id="listPane">
     <div id="listToolbar">
       <input id="searchInput" type="text" placeholder="搜索名称 / 容器路径…">
+      <button id="btnThumbs" class="btn small ghost" title="图片缩略图开关（默认关闭，提升列表打开速度、降低内存）">缩略图 关</button>
       <span id="listCount"></span>
       <div class="pager">
         <button id="btnPrev" class="btn small">‹</button>
@@ -91,6 +92,10 @@
       </div>
       <div id="animDropdown" class="anim-dropdown hidden">
         <input id="animSearch" type="text" placeholder="搜索动画名称…">
+        <div class="anim-modes">
+          <button id="animModeManual" class="btn small primary">手动 / 已绑定</button>
+          <button id="animModeMatch" class="btn small">自动匹配兼容</button>
+        </div>
         <div id="animScanState" class="anim-scan"></div>
         <div id="animList" class="anim-list"></div>
       </div>
@@ -285,7 +290,15 @@
   </div>
 </div>
 
+<div id="loadOverlay" class="load hidden">
+  <div class="load-box">
+    <div class="load-ring"></div>
+    <div id="loadText" class="load-text">加载中…</div>
+    <div class="load-sub">识别引擎 / 解包容器 / 载入缓存，请稍候</div>
+  </div>
+</div>
+
 <div id="toast" class="hidden"></div>
-<script type="module" src="/app.js?v=34"></script>
+<script type="module" src="/app.js?v=39"></script>
 </body>
 </html>

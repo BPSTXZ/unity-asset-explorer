@@ -19,7 +19,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
 
 const state = {
   detected: null, typeFilter: null, search: '', total: 0, items: [], page: 0,
-  sortKey: null, sortDir: 1,
+  sortKey: null, sortDir: 1, thumbs: false,
   selected: new Set(), current: null, scanTimer: null, exportTimer: null, exportIds: [],
   favMode: false, favType: null, favorites: [], favIds: new Set(), favPending: null, favRenameKey: null,
 };
@@ -31,6 +31,9 @@ function toast(msg, err = false) {
   clearTimeout(t._timer);
   t._timer = setTimeout(() => t.classList.add('hidden'), 4000);
 }
+function showLoad(t) { $('loadText').textContent = t || '加载中…'; $('loadOverlay').classList.remove('hidden'); }
+function setLoad(t) { $('loadText').textContent = t; }
+function hideLoad() { $('loadOverlay').classList.add('hidden'); }
 async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) {
@@ -160,6 +163,7 @@ function showEngineBadge(d) {
 async function doDetect() {
   const path = $('pathInput').value.trim();
   if (!path) return toast('请输入或选择路径', true);
+  showLoad('识别引擎 / 解包容器…');
   try {
     const d = await (await postJson('/api/detect', { path })).json();
     state.detected = d;
@@ -174,6 +178,7 @@ async function doDetect() {
       toast(d.error || '识别失败', true);
     }
   } catch (e) { toast(e.message, true); }
+  finally { hideLoad(); }
 }
 $('btnDetect').onclick = doDetect;
 
@@ -243,8 +248,9 @@ function resetProjectUI() {
   clearTimeout(state.exportTimer);
   Object.assign(state, {
     detected: null, typeFilter: null, search: '', total: 0, items: [], page: 0,
-    current: null, favMode: false, favType: null, sortKey: null, sortDir: 1,
+    current: null, favMode: false, favType: null, sortKey: null, sortDir: 1, thumbs: false,
   });
+  syncThumbsBtn();
   state.selected.clear();
   selRow = null;
   $('pathInput').value = '';
@@ -365,7 +371,7 @@ function buildRow(a) {
   tr.dataset.id = a.id;
   if (state.current?.id === a.id) { tr.classList.add('selected'); selRow = tr; }
   const fav = state.favIds.has(a.id);
-  const thumb = IMAGE_TYPES.includes(a.type)
+  const thumb = (state.thumbs && IMAGE_TYPES.includes(a.type))
     ? `<img class="thumb" loading="lazy" decoding="async" alt="" src="/api/thumbnail/${a.id}" onerror="this.remove()">`
     : '';
   const nameInner = a.alias
@@ -465,6 +471,13 @@ $('searchInput').oninput = (ev) => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => { state.search = ev.target.value.trim(); state.page = 0; loadAssets(); }, 300);
 };
+function syncThumbsBtn() {
+  const b = $('btnThumbs');
+  b.classList.toggle('primary', state.thumbs);
+  b.classList.toggle('ghost', !state.thumbs);
+  b.textContent = state.thumbs ? '缩略图 开' : '缩略图 关';
+}
+$('btnThumbs').onclick = () => { state.thumbs = !state.thumbs; syncThumbsBtn(); renderTable(); };
 function updateExportButtons() {
   $('btnExportSelected').textContent = `导出选中 (${state.selected.size})`;
   $('btnExportSelected').disabled = state.selected.size === 0;
@@ -623,6 +636,7 @@ let viewer = null;
 const anim = {
   active: false, charId: null, clipId: null, clipName: '', textured: false,
   action: null, duration: 0, clips: [], scanTimer: null, seeking: false,
+  mode: 'manual', binds: [], manual: [], manualTimer: null,
 };
 function initViewer() {
   if (viewer) return viewer;
@@ -883,7 +897,11 @@ function openAnimPanel(a, textured) {
   $('animSearch').value = '';
   $('animList').innerHTML = '';
   $('animDropdown').classList.remove('hidden');
-  pollClips();
+  anim.mode = 'manual'; anim.binds = []; anim.manual = [];
+  $('animModeManual').classList.add('primary');
+  $('animModeMatch').classList.remove('primary');
+  $('animScanState').textContent = '手动选择动画直接播放并绑定，无需等待匹配检索';
+  loadBinds(); loadManual('');
 }
 function pollClips() {
   clearTimeout(anim.scanTimer);
@@ -906,19 +924,62 @@ function pollClips() {
 function renderAnimList() {
   const box = $('animList');
   const q = $('animSearch').value.trim().toLowerCase();
-  const items = anim.clips.filter(c => !q || c.name.toLowerCase().includes(q)).slice(0, 300);
   box.innerHTML = '';
-  if (!items.length) { box.innerHTML = '<div class="empty">无匹配动画</div>'; return; }
   const frag = document.createDocumentFragment();
-  for (const c of items) {
+  const mk = (c, bound) => {
     const div = document.createElement('div');
     div.className = 'item' + (c.id === anim.clipId ? ' active' : '');
-    div.innerHTML = `<span class="nm">${c.boost ? '<span class="boost">★</span> ' : ''}${c.name}</span>` +
-      `<span class="meta">${c.duration ? c.duration.toFixed(2) + 's · ' : ''}${c.file}</span>`;
+    div.innerHTML = `<span class="nm">${bound ? '<span class="boost">绑</span> ' : (c.boost ? '<span class="boost">★</span> ' : '')}${esc(c.name)}</span>` +
+      `<span class="meta">${c.duration ? c.duration.toFixed(2) + 's · ' : ''}${esc(c.file || '')}</span>` +
+      `<button class="bind-toggle${bound ? ' on' : ''}" title="${bound ? '取消绑定' : '绑定到角色'}">${bound ? '解绑' : '绑定'}</button>`;
     div.onclick = () => loadClip(c.id, c.name);
-    frag.appendChild(div);
+    div.querySelector('.bind-toggle').onclick = (ev) => { ev.stopPropagation(); bindClip(c.id, bound); };
+    return div;
+  };
+  const sec = (t) => { const h = document.createElement('div'); h.className = 'anim-sec'; h.textContent = t; return h; };
+  if (anim.mode === 'manual') {
+    const binds = anim.binds.filter(c => !q || c.name.toLowerCase().includes(q));
+    const boundIds = new Set(anim.binds.map(b => b.id));
+    const rest = anim.manual.filter(c => !boundIds.has(c.id) && (!q || c.name.toLowerCase().includes(q))).slice(0, 200);
+    if (!binds.length && !rest.length) { box.innerHTML = '<div class="empty">无动画</div>'; return; }
+    if (binds.length) { frag.appendChild(sec(`已绑定 (${binds.length})`)); binds.forEach(c => frag.appendChild(mk(c, true))); }
+    frag.appendChild(sec(q ? `搜索全部动画 (${rest.length})` : '全部动画（点击播放并绑定）'));
+    rest.forEach(c => frag.appendChild(mk(c, false)));
+  } else {
+    const items = anim.clips.filter(c => !q || c.name.toLowerCase().includes(q)).slice(0, 300);
+    if (!items.length) { box.innerHTML = '<div class="empty">无匹配动画（点「自动匹配兼容」检索）</div>'; return; }
+    items.forEach(c => frag.appendChild(mk(c, false)));
   }
   box.appendChild(frag);
+}
+function setAnimMode(mode) {
+  anim.mode = mode;
+  $('animModeManual').classList.toggle('primary', mode === 'manual');
+  $('animModeMatch').classList.toggle('primary', mode === 'match');
+  if (mode === 'manual') {
+    $('animScanState').textContent = '手动选择动画直接播放并绑定，无需等待匹配检索';
+    loadBinds(); loadManual($('animSearch').value.trim());
+  } else {
+    pollClips();
+  }
+  renderAnimList();
+}
+async function loadBinds() {
+  try { anim.binds = (await (await api(`/api/character_binds/${anim.charId}`)).json()).binds || []; }
+  catch { anim.binds = []; }
+  if (anim.mode === 'manual') renderAnimList();
+}
+async function loadManual(q) {
+  try {
+    anim.manual = (await (await api(`/api/assets?type=AnimationClip&search=${encodeURIComponent(q)}&limit=200`)).json()).items || [];
+  } catch { anim.manual = []; }
+  if (anim.mode === 'manual') renderAnimList();
+}
+async function bindClip(id, remove = false) {
+  try {
+    anim.binds = (await (await postJson(`/api/character_binds/${anim.charId}`, { clip: id, remove })).json()).binds || [];
+  } catch {}
+  if (anim.mode === 'manual') renderAnimList();
 }
 async function loadClip(id, name) {
   const token = ++previewToken;
@@ -991,7 +1052,14 @@ $('animClipBtn').onclick = () => {
   dd.classList.toggle('hidden');
   if (!dd.classList.contains('hidden')) { renderAnimList(); $('animSearch').focus(); }
 };
-$('animSearch').oninput = renderAnimList;
+$('animSearch').oninput = () => {
+  if (anim.mode === 'manual') {
+    clearTimeout(anim.manualTimer);
+    anim.manualTimer = setTimeout(() => loadManual($('animSearch').value.trim()), 250);
+  } else renderAnimList();
+};
+$('animModeManual').onclick = () => setAnimMode('manual');
+$('animModeMatch').onclick = () => setAnimMode('match');
 $('animPlay').onclick = () => { if (anim.action) anim.action.paused = !anim.action.paused; };
 $('animSeek').oninput = (ev) => {
   if (!anim.action || !viewer?.mixer) return;
@@ -1663,9 +1731,17 @@ function homeCard(p) {
 }
 async function openProject(p) {
   $('pathInput').value = p.path;
-  if (p.current && (p.asset_count || p.scan_state === 'scanning' || p.scan_state === 'paused')) {
-    closeHome(); return;
+  if (p.current && (p.scan_state === 'scanning' || p.scan_state === 'paused')) { closeHome(); return; }
+  showLoad('打开项目…');
+  let r = null;
+  try { r = await (await postJson('/api/project/open', { path: p.path })).json(); } catch {}
+  if (r && r.restored) {
+    setLoad('载入项目缓存…');
+    await syncWorkspace();
+    closeHome(); hideLoad();
+    return;
   }
+  hideLoad();
   await doDetect();
   if (state.detected?.supported) { closeHome(); $('btnScan').click(); }
   else if (state.detected?.engine) closeHome();
@@ -1681,12 +1757,8 @@ $('homeDetect').onclick = async () => {
 $('homeBack').onclick = closeHome;
 $('brandHome').onclick = openHome;
 
-// 启动时恢复上一次打开的项目
-(async () => {
-  initDividers();
-  initSidebarToggles();
-  loadFavorites();
-  openHome();
+// 从后端会话/扫描状态同步工作台（启动恢复与缓存切换共用）
+async function syncWorkspace() {
   try {
     const sess = await (await api('/api/session')).json();
     if (sess.active) {
@@ -1699,7 +1771,17 @@ $('brandHome').onclick = openHome;
     if (st.state === 'idle') return;
     $('scanProgress').classList.remove('hidden');
     if (st.asset_count) { renderTypeList(st.type_counts); loadAssets(); $('btnExportAll').disabled = false; $('btnGallery').disabled = false; $('btnKp').disabled = false; }
-    if (st.state === 'running') { $('btnScan').disabled = true; pollScan(); }
+    if (st.state === 'running' || st.state === 'paused') { $('btnScan').disabled = st.state === 'running'; pollScan(); }
     else $('scanProgress').querySelector('.label').textContent = `完成 · ${st.asset_count} 资源`;
+    loadFavorites();
   } catch {}
+}
+
+// 启动时恢复上一次打开的项目
+(async () => {
+  initDividers();
+  initSidebarToggles();
+  loadFavorites();
+  openHome();
+  syncWorkspace();
 })();
