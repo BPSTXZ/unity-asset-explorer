@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Asset Explorer · 游戏资源提取</title>
-<link rel="stylesheet" href="/style.css?v=21">
+<link rel="stylesheet" href="/style.css?v=22">
 <script type="importmap">
 {
   "imports": {
@@ -216,6 +216,8 @@
     <button id="kpTranslate" class="btn small" title="在线翻译当前页脚本/字段名（日语/生词）">在线翻译</button>
     <button id="kpSave" class="btn small" disabled>保存修改</button>
     <button id="kpExport" class="btn small" disabled>导出 bundle</button>
+    <button id="kpLive" class="btn small primary" disabled title="备份原游戏文件并覆盖为修改后的 bundle">一键生效</button>
+    <button id="kpRestore" class="btn small" disabled title="从备份恢复原游戏文件">脚本还原</button>
     <button id="kpTrCfg" class="btn small ghost" title="在线翻译设置">⚙</button>
     <button id="kpClose" class="btn small ghost">关闭</button>
   </div>
@@ -261,6 +263,8 @@
       <button id="editTranslate" class="btn" title="用百度/有道在线翻译脚本与字段名（日语/生词）">在线翻译</button>
       <button id="editTrCfg" class="btn ghost" title="在线翻译设置">⚙</button>
       <button id="editExport" class="btn" disabled>导出修改的 bundle</button>
+      <button id="editLive" class="btn primary" disabled title="备份原游戏文件并覆盖为修改后的 bundle">一键生效</button>
+      <button id="editRestore" class="btn" disabled title="从备份恢复原游戏文件">脚本还原</button>
       <button id="editApply" class="btn primary" disabled>保存修改</button>
       <button id="editClose" class="btn">关闭</button>
     </div>
@@ -299,6 +303,6 @@
 </div>
 
 <div id="toast" class="hidden"></div>
-<script type="module" src="/app.js?v=39"></script>
+<script type="module" src="/app.js?v=43"></script>
 </body>
 </html>

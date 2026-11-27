@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import string
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -1175,7 +1176,15 @@ def api_asset_editable(aid: int):
         except Exception:
             return {"editable": False, "kind": "fields", "name": meta["name"],
                     "reason": "无类型信息（IL2CPP），无法编辑字段"}
-        fields = [{**f, **glossary.explain_field(f["path"], f["type"])} for f in _flatten_fields(tt)]
+        # UnityPy 重读 typetree 不反映 save_typetree，故用待导出记录里的改动值覆盖磁盘值
+        with _edit_lock:
+            pend = (_edit_pending.get(aid) or {}).get("fields") or {}
+        akey = _asset_key(meta)
+        fields = []
+        for f in _flatten_fields(tt):
+            val = _coerce(pend[f["path"]], f["value"]) if f["path"] in pend else f["value"]
+            fields.append({**f, **glossary.explain_field(f["path"], f["type"]),
+                           "value": val, "changed": _field_changed(akey, f["path"], val)})
         cls = (meta.get("extra") or {}).get("class", "")
         return {"editable": True, "kind": "fields", "name": meta["name"],
                 "classname": cls, "purpose": glossary.explain_class(cls), "fields": fields}
@@ -1193,6 +1202,7 @@ def api_asset_edit(aid: int, req: EditReq):
         raise HTTPException(404, "资源不存在，请先扫描")
     meta = _state["assets"][aid]
     t = meta["type"]
+    _ensure_baseline(meta["file_path"])
     env = _get_edit_env(meta["file_path"])
     reader = _find_reader(env, meta)
     if reader is None:
@@ -1208,7 +1218,11 @@ def api_asset_edit(aid: int, req: EditReq):
             if not req.fields:
                 raise HTTPException(400, "缺少字段修改")
             tt = reader.read_typetree()
-            for path, val in req.fields.items():
+            _capture_initial(_asset_key(meta), tt, list(req.fields))
+            # read_typetree 不反映既往 save_typetree，重放全部累计改动，避免分次保存丢失先前字段
+            with _edit_lock:
+                prev = (_edit_pending.get(aid) or {}).get("fields") or {}
+            for path, val in {**prev, **req.fields}.items():
                 _set_by_path(tt, path, val)
             reader.save_typetree(tt)
         else:
@@ -1218,7 +1232,12 @@ def api_asset_edit(aid: int, req: EditReq):
     except Exception as e:
         raise HTTPException(500, f"修改失败: {e}")
     with _edit_lock:
-        _edit_pending[aid] = {"aid": aid, "name": meta["name"], "type": t, "file": meta["file"]}
+        rec = _edit_pending.get(aid) or {"aid": aid, "name": meta["name"], "type": t, "file": meta["file"]}
+        if t in ("MonoBehaviour", "ScriptableObject") and req.fields:
+            flds = rec.get("fields") or {}
+            flds.update(req.fields)
+            rec["fields"] = flds
+        _edit_pending[aid] = rec
     return {"ok": True, "pending": len(_edit_pending)}
 
 
@@ -1245,6 +1264,242 @@ def api_edit_export():
         _edit_envs.clear()
         _edit_pending.clear()
     return {"ok": True, "out_dir": str(out_root), "written": written}
+
+
+# ---------- 一键生效（备份原文件后覆盖）与脚本还原（从备份恢复） ----------
+BACKUP_DIR = CACHE_DIR / "orig_backup"
+BACKUP_DIR.mkdir(exist_ok=True)
+APPLY_FILE = CACHE_DIR / "apply_log.json"
+_apply_log: list[dict] = []
+_apply_lock = threading.Lock()
+
+
+def _load_apply():
+    global _apply_log
+    try:
+        _apply_log = json.loads(APPLY_FILE.read_text(encoding="utf-8")) or []
+    except (OSError, ValueError):
+        _apply_log = []
+
+
+def _save_apply():
+    try:
+        APPLY_FILE.write_text(json.dumps(_apply_log, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+_load_apply()
+
+
+def _md5_file(p) -> str:
+    return hashlib.md5(Path(p).read_bytes()).hexdigest()
+
+
+# 初始基线：首次改动前记录原文件备份 + md5，跨会话保留；每次进入对比当前与基线，不匹配即可还原
+BASELINE_FILE = CACHE_DIR / "baseline_log.json"
+_baseline: list[dict] = []
+_base_lock = threading.Lock()
+
+
+def _load_baseline():
+    global _baseline
+    try:
+        _baseline = json.loads(BASELINE_FILE.read_text(encoding="utf-8")) or []
+    except (OSError, ValueError):
+        _baseline = []
+
+
+def _save_baseline():
+    try:
+        BASELINE_FILE.write_text(json.dumps(_baseline, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+_load_baseline()
+
+
+def _ensure_baseline(path: str):
+    p = Path(path)
+    if not p.exists() or CACHE_DIR in p.parents:
+        return
+    with _base_lock:
+        if any(e["path"] == path for e in _baseline):
+            return
+        backup = BACKUP_DIR / (hashlib.md5(_norm_path(path).encode("utf-8")).hexdigest()[:16] + ".init.bak")
+        try:
+            shutil.copy2(p, backup)
+            _baseline.append({"path": path, "name": p.name, "backup": str(backup),
+                              "init_md5": _md5_file(p), "recorded_at": time.time()})
+            _save_baseline()
+        except OSError:
+            pass
+
+
+def _diverged_entries() -> list[dict]:
+    with _base_lock:
+        entries = list(_baseline)
+    out = []
+    for e in entries:
+        p = Path(e["path"])
+        try:
+            if p.exists() and _md5_file(p) != e["init_md5"]:
+                out.append(e)
+        except OSError:
+            continue
+    return out
+
+
+# 字段级初始值基线：用于标记"哪些参数改动过"（当前值 != 初始值）
+PARAM_BASELINE_FILE = CACHE_DIR / "param_baseline.json"
+_pb: dict[str, dict] = {}
+_pb_lock = threading.Lock()
+
+
+def _load_pb():
+    global _pb
+    try:
+        _pb = json.loads(PARAM_BASELINE_FILE.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        _pb = {}
+
+
+def _save_pb():
+    try:
+        PARAM_BASELINE_FILE.write_text(json.dumps(_pb, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+_load_pb()
+
+
+def _capture_initial(asset_key: str, tt, paths):
+    vals = {f["path"]: f["value"] for f in _flatten_fields(tt)}
+    with _pb_lock:
+        d = _pb.setdefault(asset_key, {})
+        dirty = False
+        for p in paths:
+            if p not in d and p in vals:
+                d[p] = vals[p]
+                dirty = True
+        if dirty:
+            _save_pb()
+
+
+def _field_changed(asset_key: str, path: str, value) -> bool:
+    with _pb_lock:
+        d = _pb.get(asset_key)
+    if not d or path not in d:
+        return False
+    return d[path] != value
+
+
+@app.get("/api/edit/diverged")
+def api_edit_diverged():
+    """当前游戏文件与初始基线不匹配的项（含历史会话/已生效的改动），均可还原。"""
+    out = _diverged_entries()
+    return {"total": len(out), "items": out}
+
+
+@app.get("/api/edit/applied")
+def api_edit_applied():
+    with _apply_lock:
+        return {"total": len(_apply_log), "items": list(_apply_log)}
+
+
+@app.post("/api/edit/apply")
+def api_edit_apply():
+    """一键生效：备份原文件 → 覆盖修改后的 bundle。容器（APK/OBB 解包）不支持直接覆盖。"""
+    with _edit_lock:
+        if not _edit_envs:
+            raise HTTPException(400, "无待生效的修改")
+        envs = dict(_edit_envs)
+    applied, skipped = [], []
+    tmp = Path(tempfile.mkdtemp(prefix="apply_", dir=str(CACHE_DIR)))
+    try:
+        for key, env in envs.items():
+            orig = Path(key)
+            if not orig.exists():
+                skipped.append({"name": orig.name, "reason": "原文件不存在"})
+                continue
+            if CACHE_DIR in orig.parents:
+                skipped.append({"name": orig.name, "reason": "APK/OBB 解包容器不支持直接覆盖，请用导出后自行重打包"})
+                continue
+            backup = BACKUP_DIR / (hashlib.md5(_norm_path(key).encode("utf-8")).hexdigest()[:16] + ".bak")
+            try:
+                shutil.copy2(orig, backup)
+                orig_md5 = _md5_file(orig)
+                sub = tmp / hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
+                sub.mkdir(parents=True, exist_ok=True)
+                env.save(pack="none", out_path=str(sub))
+                prod = sub / orig.name
+                if not prod.exists():
+                    cands = [p for p in sub.iterdir() if p.is_file()]
+                    prod = cands[0] if len(cands) == 1 else None
+                if prod is None:
+                    skipped.append({"name": orig.name, "reason": "导出产物无法定位"})
+                    continue
+                shutil.copyfile(prod, orig)
+                entry = {"path": key, "name": orig.name, "backup": str(backup),
+                         "orig_md5": orig_md5, "applied_at": time.time()}
+                with _apply_lock:
+                    _apply_log[:] = [e for e in _apply_log if e["path"] != key]
+                    _apply_log.append(entry)
+                    _save_apply()
+                applied.append(orig.name)
+            except OSError as e:
+                skipped.append({"name": orig.name, "reason": str(e)})
+        with _edit_lock:
+            for key in envs:
+                _edit_envs.pop(key, None)
+            _edit_pending.clear()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return {"applied": applied, "skipped": skipped}
+
+
+class RestoreReq(BaseModel):
+    paths: list[str] = []
+
+
+@app.post("/api/edit/restore")
+def api_edit_restore(req: RestoreReq):
+    """脚本还原：把与初始基线不匹配的文件恢复为初始参数（md5 校验）；paths 为空还原全部不匹配项。"""
+    div = _diverged_entries()
+    targets = [e for e in div if not req.paths or e["path"] in req.paths]
+    if not targets:
+        raise HTTPException(400, "当前参数与初始一致，无需还原")
+    restored, failed = [], []
+    for e in targets:
+        b, orig = Path(e["backup"]), Path(e["path"])
+        try:
+            if not b.exists():
+                raise OSError("初始备份缺失")
+            shutil.copy2(b, orig)
+            if _md5_file(orig) != e["init_md5"]:
+                raise OSError("还原后校验不一致")
+            restored.append(e["name"])
+            with _apply_lock:
+                _apply_log[:] = [x for x in _apply_log if x["path"] != e["path"]]
+                _save_apply()
+            for it in _state.get("keyparams") or []:
+                a = it.get("aid")
+                if isinstance(a, int) and 0 <= a < len(_state["assets"]) \
+                        and _state["assets"][a]["file_path"] == e["path"]:
+                    init = _pb.get(_asset_key(_state["assets"][a]), {}).get(it["path"])
+                    if init is not None:
+                        it["value"] = init
+            _save_keyparams(_state.get("keyparams") or [])
+            with _edit_lock:
+                for a, m in enumerate(_state["assets"]):
+                    if os.path.normpath(m["file_path"]) == e["path"]:
+                        _edit_pending.pop(a, None)
+                _edit_envs.pop(e["path"], None)
+        except OSError as ex:
+            failed.append({"name": e["name"], "reason": str(ex)})
+    return {"restored": restored, "failed": failed}
 
 
 # ---------- 关键参数一键识别 ----------
@@ -1421,6 +1676,9 @@ def api_keyparams(category: str | None = None, priority: str | None = None,
     for it in items:
         if "purpose" not in it:
             it["purpose"] = glossary.explain_class(it.get("class", ""))
+        aid = it.get("aid")
+        if isinstance(aid, int) and 0 <= aid < len(_state["assets"]):
+            it["changed"] = _field_changed(_asset_key(_state["assets"][aid]), it["path"], it["value"])
     cc, pc = _kp_counts(items)
     sel = items
     if priority == "any":
@@ -1464,19 +1722,28 @@ def api_keyparams_save(req: KeyParamSaveReq):
         meta = _state["assets"][aid]
         if meta["type"] not in ("MonoBehaviour", "ScriptableObject"):
             continue
+        _ensure_baseline(meta["file_path"])
         env = _get_edit_env(meta["file_path"])
         reader = _find_reader(env, meta)
         if reader is None:
             continue
         try:
             tt = reader.read_typetree()
-            for path, val in fields.items():
+            _capture_initial(_asset_key(meta), tt, list(fields))
+            # read_typetree 不反映既往 save_typetree，重放全部累计改动，避免分次保存丢失先前字段
+            with _edit_lock:
+                prev = (_edit_pending.get(aid) or {}).get("fields") or {}
+            for path, val in {**prev, **fields}.items():
                 _set_by_path(tt, path, val)
             reader.save_typetree(tt)
         except Exception as e:
             raise HTTPException(500, f"修改失败（{meta['name']}）: {e}")
         with _edit_lock:
-            _edit_pending[aid] = {"aid": aid, "name": meta["name"], "type": meta["type"], "file": meta["file"]}
+            rec = _edit_pending.get(aid) or {"aid": aid, "name": meta["name"], "type": meta["type"], "file": meta["file"]}
+            flds = rec.get("fields") or {}
+            flds.update(fields)
+            rec["fields"] = flds
+            _edit_pending[aid] = rec
         applied += 1
     changed = {(ch.aid, ch.path): ch.value for ch in req.changes}
     items = _state.get("keyparams") or []

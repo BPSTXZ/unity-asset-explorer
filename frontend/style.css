@@ -237,6 +237,11 @@ td.dim { color: var(--dim); font-size: 12px; max-width: 180px; overflow: hidden;
 .anim-list .bind-toggle { flex-shrink: 0; margin-left: 6px; background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; color: var(--dim); cursor: pointer; font-size: 11px; padding: 1px 6px; }
 .anim-list .bind-toggle:hover { border-color: var(--accent); color: var(--text); }
 .anim-list .bind-toggle.on { color: var(--accent2); border-color: rgba(62, 207, 142, .5); }
+
+/* 相对初始值已改动的参数标记 */
+.f-changed { color: #ffb454; border: 1px solid rgba(255, 180, 84, .5); border-radius: 3px; font-size: 10px; padding: 0 4px; font-style: normal; margin-left: 4px; }
+.field-row.changed { background: rgba(255, 180, 84, .08); }
+.kp-row.changed { background: rgba(255, 180, 84, .08); }
 .spinner {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: var(--dim); gap: 8px;

@@ -1232,12 +1232,13 @@ function renderFieldRows() {
   const frag = document.createDocumentFragment();
   for (const f of rows) {
     const row = document.createElement('div');
-    row.className = 'field-row';
+    row.className = 'field-row' + (f.changed ? ' changed' : '');
     const on = onlineTr[f.name];
     const zhText = on || f.zh;
     const badge = on ? '<em class="f-online">在线</em>' : (f.exact ? '' : '<em class="f-guess">推测</em>');
     const zh = zhText ? `<span class="f-zh">${esc(zhText)}${badge}</span>` : '';
-    row.innerHTML = `<span class="f-path"><span class="f-key" title="${esc(f.path)}">${esc(f.path)}</span>${zh}</span><span class="f-type">${esc(f.type)}</span>`;
+    const chg = f.changed ? '<em class="f-changed" title="与初始值不同">改</em>' : '';
+    row.innerHTML = `<span class="f-path"><span class="f-key" title="${esc(f.path)}">${esc(f.path)}</span>${zh}${chg}</span><span class="f-type">${esc(f.type)}</span>`;
     const inp = document.createElement('input');
     inp.className = 'f-val';
     if (f.type === 'bool') { inp.type = 'checkbox'; inp.checked = !!f.value; }
@@ -1257,7 +1258,9 @@ async function refreshPending() {
     const d = await (await api('/api/edit/pending')).json();
     $('editPending').textContent = d.total ? `待导出 ${d.total} 项` : '';
     $('editExport').disabled = !d.total;
+    $('editLive').disabled = !d.total;
   } catch {}
+  refreshApplied();
 }
 $('editApply').onclick = async () => {
   const body = {};
@@ -1271,6 +1274,10 @@ $('editApply').onclick = async () => {
     editor.changed = {};
     toast('已保存修改（待导出）');
     refreshPending();
+    if (editor.kind === 'fields') {
+      const d = await (await api(`/api/asset/${editor.aid}/editable`)).json();
+      if (d.editable && d.fields) { editor.fields = d.fields; renderFieldRows(); }
+    }
   } catch (e) { toast(e.message, true); }
 };
 $('editExport').onclick = async () => {
@@ -1448,8 +1455,9 @@ function renderKpList() {
   for (const it of kp.items) {
     const key = it.aid + '|' + it.path;
     const row = document.createElement('div');
-    row.className = 'kp-row'; row.dataset.key = key;
+    row.className = 'kp-row' + (it.changed ? ' changed' : ''); row.dataset.key = key;
     const badge = it.priority ? `<span class="kp-badge">${esc(it.priority)}</span>` : '';
+    const chg = it.changed ? '<em class="f-changed" title="与初始值不同">改</em>' : '';
     const leaf = it.path.split('.').pop().replace(/\[\d+\]/g, '');
     const on = onlineTr[leaf];
     const zhText = on || it.zh;
@@ -1462,7 +1470,7 @@ function renderKpList() {
     const purposeHtml = purpose ? `<span class="kp-szh" title="${esc(purpose)}">${esc(purpose)}${pbadge}</span>` : '';
     const classHtml = (cls && cls !== it.name) ? `<span class="kp-sclass">${esc(cls)}</span>` : '';
     row.innerHTML = `<div class="kp-script" title="${esc(cls)}"><span class="kp-sname">${esc(it.name)}</span>${purposeHtml}${classHtml}</div>`
-      + `<div class="kp-field"><span class="kp-keyline">${badge}<span class="kp-key" title="${esc(it.path)}">${esc(it.path)}</span></span>${zh}</div>`;
+      + `<div class="kp-field"><span class="kp-keyline">${badge}${chg}<span class="kp-key" title="${esc(it.path)}">${esc(it.path)}</span></span>${zh}</div>`;
     const inp = document.createElement('input');
     inp.className = 'kp-val';
     const cur = kp.changed[key] ? kp.changed[key].value : it.value;
@@ -1503,8 +1511,44 @@ async function refreshKpPending() {
     const d = await (await api('/api/edit/pending')).json();
     $('kpPending').textContent = d.total ? `待导出 ${d.total} 项` : '';
     $('kpExport').disabled = !d.total;
+    $('kpLive').disabled = !d.total;
   } catch {}
+  refreshApplied();
 }
+async function refreshApplied() {
+  let n = 0;
+  try { n = (await (await api('/api/edit/diverged')).json()).total || 0; } catch {}
+  for (const id of ['editRestore', 'kpRestore']) {
+    const b = $(id); if (!b) continue;
+    b.disabled = !n;
+    b.textContent = n ? `脚本还原 (${n})` : '脚本还原';
+  }
+}
+async function liveApply() {
+  if (!confirm('一键生效：先备份原游戏文件，再覆盖为修改后的 bundle。\n仅建议离线单机使用；之后可随时「脚本还原」恢复原文件。是否继续？')) return;
+  try {
+    const r = await (await postJson('/api/edit/apply', {})).json();
+    const sk = r.skipped || [];
+    if (r.applied.length) {
+      toast(`已生效 ${r.applied.length} 个 bundle（原文件已备份）` + (sk.length ? `；跳过 ${sk.length}（${sk[0].reason}）` : ''));
+    } else {
+      toast(sk[0]?.reason || '无待生效的修改', true);
+    }
+    refreshPending(); refreshKpPending(); refreshApplied();
+  } catch (e) { toast(e.message, true); }
+}
+async function restoreApplied() {
+  if (!confirm('脚本还原：把与初始参数不匹配的文件恢复为初始状态（覆盖当前文件）。\n是否继续？')) return;
+  try {
+    const r = await (await postJson('/api/edit/restore', { paths: [] })).json();
+    toast(`已还原 ${r.restored.length} 个原文件` + (r.failed?.length ? `；失败 ${r.failed.length}（${r.failed[0].reason}）` : ''));
+    refreshApplied(); loadKp();
+  } catch (e) { toast(e.message, true); }
+}
+$('editLive').onclick = liveApply;
+$('kpLive').onclick = liveApply;
+$('editRestore').onclick = restoreApplied;
+$('kpRestore').onclick = restoreApplied;
 $('btnKp').onclick = openKp;
 $('kpClose').onclick = closeKp;
 $('kpScan').onclick = kpScan;
@@ -1784,4 +1828,5 @@ async function syncWorkspace() {
   loadFavorites();
   openHome();
   syncWorkspace();
+  refreshApplied();
 })();
