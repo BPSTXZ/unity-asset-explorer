@@ -12,7 +12,7 @@ from ..exporters.character import find_characters
 EXTRACTABLE = {
     "Mesh", "Texture2D", "Sprite", "AnimationClip", "AudioClip",
     "Material", "TextAsset", "Font", "Cubemap", "VideoClip", "Shader",
-    "MonoBehaviour", "ScriptableObject",
+    "MonoBehaviour", "ScriptableObject", "GameObject",
 }
 
 
@@ -42,6 +42,8 @@ def _extra_info(data, tname: str) -> dict:
                 except Exception:
                     pass
             return {"shader": name}
+        if tname == "GameObject":
+            return {"active": bool(getattr(data, "m_IsActive", True))}
     except Exception:
         pass
     return {}

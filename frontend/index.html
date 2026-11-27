@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Asset Explorer · 游戏资源提取</title>
-<link rel="stylesheet" href="/style.css?v=22">
+<link rel="stylesheet" href="/style.css?v=24">
 <script type="importmap">
 {
   "imports": {
@@ -41,6 +41,7 @@
     <div class="side-title">浏览</div>
     <button id="btnGallery" class="btn wide" disabled>CG 画廊</button>
     <button id="btnKp" class="btn wide" disabled>关键参数</button>
+    <button id="btnModguide" class="btn wide" disabled>修改指南</button>
     <div class="side-title">导出</div>
     <button id="btnExportSelected" class="btn primary wide" disabled>导出选中 (0)</button>
     <button id="btnExportAll" class="btn wide" disabled>导出当前筛选</button>
@@ -235,6 +236,28 @@
   </div>
 </div>
 
+<div id="mgOverlay" class="mg hidden">
+  <div class="mg-bar">
+    <span class="mg-title">修改指南</span>
+    <span id="mgGame" class="mg-game"></span>
+    <span class="mg-scope">仅离线单机 modding · 联机 / 反作弊不适用</span>
+    <button id="mgAnalyze" class="btn small primary">一键分析</button>
+    <span id="mgProgress" class="mg-progress"></span>
+    <button id="mgClose" class="btn small ghost">关闭</button>
+  </div>
+  <div id="mgBody" class="mg-body">
+    <div class="mg-empty">点「一键分析」识别当前游戏的货币 / 存档机制与可行改法，结果按项目保存供参考。</div>
+  </div>
+  <div class="mg-notes">
+    <div class="mg-notes-head">结论与建议笔记（按项目保存，供使用者参考）</div>
+    <textarea id="mgNotes" class="mg-notes-text" spellcheck="false" placeholder="记录分析结论、具体改法、注意事项…"></textarea>
+    <div class="mg-notes-foot">
+      <button id="mgSaveNotes" class="btn small primary">保存笔记</button>
+      <span id="mgNotesStatus" class="mg-notes-status"></span>
+    </div>
+  </div>
+</div>
+
 <div id="lightbox" class="lightbox hidden">
   <div class="lb-top">
     <span id="lbName" class="lb-name"></span>
@@ -303,6 +326,6 @@
 </div>
 
 <div id="toast" class="hidden"></div>
-<script type="module" src="/app.js?v=43"></script>
+<script type="module" src="/app.js?v=46"></script>
 </body>
 </html>

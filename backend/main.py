@@ -30,6 +30,7 @@ from .exporters.character import character_to_glb, mesh_to_glb_textured, charact
 from .paths import CACHE_DIR, EXPORT_DIR, FRONTEND_DIR
 from . import glossary
 from . import translate
+from . import modguide
 
 CACHE_DIR.mkdir(exist_ok=True, parents=True)
 DEFAULT_EXPORT_DIR = EXPORT_DIR
@@ -1169,6 +1170,20 @@ def api_asset_editable(aid: int):
         text = s if isinstance(s, str) else s.decode("utf-8", "replace")
         return {"editable": True, "kind": "text", "name": meta["name"], "text": text,
                 "format": _text_format(text)}
+    if t == "GameObject":
+        _, reader = _get_reader(aid)
+        go = reader.read()
+        val = bool(go.m_IsActive)
+        with _edit_lock:
+            pend = (_edit_pending.get(aid) or {}).get("fields") or {}
+        if "m_IsActive" in pend:
+            val = _coerce(pend["m_IsActive"], val)
+        fields = [{"path": "m_IsActive", "type": "bool", "value": val,
+                   "zh": "激活状态", "exact": True,
+                   "changed": _field_changed(_asset_key(meta), "m_IsActive", val)}]
+        return {"editable": True, "kind": "fields", "name": meta["name"],
+                "classname": "", "purpose": "游戏对象：勾选=显示/启用，取消=隐藏（如内置 GM 面板）",
+                "fields": fields}
     if t in ("MonoBehaviour", "ScriptableObject"):
         _, reader = _get_reader(aid)
         try:
@@ -1225,6 +1240,15 @@ def api_asset_edit(aid: int, req: EditReq):
             for path, val in {**prev, **req.fields}.items():
                 _set_by_path(tt, path, val)
             reader.save_typetree(tt)
+        elif t == "GameObject":
+            if not req.fields or "m_IsActive" not in req.fields:
+                raise HTTPException(400, "缺少激活状态修改")
+            go = reader.read()
+            _capture_initial(_asset_key(meta), {"m_IsActive": bool(go.m_IsActive)}, ["m_IsActive"])
+            with _edit_lock:
+                prev = (_edit_pending.get(aid) or {}).get("fields") or {}
+            go.m_IsActive = _coerce({**prev, **req.fields}["m_IsActive"], bool(go.m_IsActive))
+            go.save()
         else:
             raise HTTPException(400, "该类型暂不支持编辑")
     except HTTPException:
@@ -1233,7 +1257,7 @@ def api_asset_edit(aid: int, req: EditReq):
         raise HTTPException(500, f"修改失败: {e}")
     with _edit_lock:
         rec = _edit_pending.get(aid) or {"aid": aid, "name": meta["name"], "type": t, "file": meta["file"]}
-        if t in ("MonoBehaviour", "ScriptableObject") and req.fields:
+        if t in ("MonoBehaviour", "ScriptableObject", "GameObject") and req.fields:
             flds = rec.get("fields") or {}
             flds.update(req.fields)
             rec["fields"] = flds
@@ -1917,6 +1941,75 @@ def api_open_folder(req: PathReq):
     if not p.exists():
         raise HTTPException(404, "目录不存在")
     os.startfile(str(p))  # noqa: S606 — 本地工具，打开资源管理器
+    return {"ok": True}
+
+
+# ---------- 修改指南（离线单机 modding 分析 + 结论笔记） ----------
+MODGUIDE_DIR = CACHE_DIR / "modguide"
+MODGUIDE_DIR.mkdir(exist_ok=True)
+
+
+def _modguide_key() -> str:
+    path = (_state["detect"] or {}).get("root") or _state["scan_path"] or ""
+    return hashlib.md5(_norm_path(path).encode("utf-8")).hexdigest()[:16] if path else ""
+
+
+def _modguide_file(key: str) -> Path:
+    return MODGUIDE_DIR / (key + ".json")
+
+
+def _load_modguide(key: str) -> dict:
+    if not key:
+        return {}
+    try:
+        return json.loads(_modguide_file(key).read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_modguide(key: str, data: dict):
+    if not key:
+        return
+    try:
+        _modguide_file(key).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+@app.get("/api/modguide")
+def api_modguide_get():
+    key = _modguide_key()
+    data = _load_modguide(key)
+    return {"has_project": bool(key), "report": data.get("report"), "notes": data.get("notes", "")}
+
+
+@app.post("/api/modguide/analyze")
+def api_modguide_analyze():
+    det = _state["detect"]
+    if not det or not det.get("engine"):
+        raise HTTPException(400, "请先识别游戏引擎")
+    if det.get("engine") != "unity":
+        raise HTTPException(400, "修改指南分析目前仅支持 Unity 游戏")
+    key = _modguide_key()
+    report = modguide.analyze(det)
+    data = _load_modguide(key)
+    data["report"] = report
+    _save_modguide(key, data)
+    return {"report": report, "notes": data.get("notes", "")}
+
+
+class ModguideNotesReq(BaseModel):
+    notes: str = ""
+
+
+@app.post("/api/modguide/notes")
+def api_modguide_notes(req: ModguideNotesReq):
+    key = _modguide_key()
+    if not key:
+        raise HTTPException(400, "请先识别 / 打开游戏")
+    data = _load_modguide(key)
+    data["notes"] = req.notes
+    _save_modguide(key, data)
     return {"ok": True}
 
 

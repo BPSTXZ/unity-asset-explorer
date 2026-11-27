@@ -9,11 +9,11 @@ const TYPE_ZH = {
   Character: '角色', Mesh: '模型', Texture2D: '贴图', Sprite: '精灵图', AnimationClip: '动画片段',
   AudioClip: '音频片段', Material: '材质', Shader: '着色器', TextAsset: '文本资源',
   Font: '字体', Cubemap: '立方体贴图', VideoClip: '视频片段',
-  MonoBehaviour: '脚本组件', ScriptableObject: '配置对象',
+  MonoBehaviour: '脚本组件', ScriptableObject: '配置对象', GameObject: '游戏对象',
 };
 const zh = (t) => TYPE_ZH[t] || t;
 const IMAGE_TYPES = ['Texture2D', 'Sprite', 'Cubemap'];
-const EDITABLE_TYPES = ['TextAsset', 'MonoBehaviour', 'ScriptableObject'];
+const EDITABLE_TYPES = ['TextAsset', 'MonoBehaviour', 'ScriptableObject', 'GameObject'];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -170,6 +170,7 @@ async function doDetect() {
     if (d.engine) {
       showEngineBadge(d);
       $('btnScan').disabled = !d.supported;
+      $('btnModguide').disabled = !d.supported;
       if (!d.supported) toast(d.notes?.join('；') || '该引擎暂不支持解析', true);
       else if (d.notes?.length) toast(d.notes.join('；'));
     } else {
@@ -262,8 +263,10 @@ function resetProjectUI() {
   $('btnExportAll').disabled = true;
   $('btnGallery').disabled = true;
   $('btnKp').disabled = true;
+  $('btnModguide').disabled = true;
   closeGallery();
   closeKp();
+  closeModguide();
   $('searchInput').value = '';
   $('checkAll').checked = false;
   for (const id of ['thName', 'thSize']) $(id).querySelector('.arrow').textContent = '';
@@ -1113,6 +1116,11 @@ async function showPreview(a) {
       $('previewBody').appendChild(au);
       return;
     }
+    if (a.type === 'GameObject') {
+      const act = a.extra && a.extra.active;
+      $('previewBody').innerHTML = `<div class="placeholder">游戏对象 <b>${esc(a.name)}</b><br>激活状态：${act ? '显示 / 启用' : '隐藏 / 禁用'}<br>点上方「编辑参数」切换激活态（如启用隐藏的内置 GM 面板）。</div>`;
+      return;
+    }
     const text = await (await api(`/api/preview/${a.id}`)).text();
     if (token !== previewToken) return;
     const pre = document.createElement('pre');
@@ -1562,6 +1570,73 @@ $('kpSearch').oninput = (e) => {
   kpSearchTimer = setTimeout(() => { kp.search = e.target.value.trim(); kp.page = 0; loadKp(); }, 300);
 };
 
+// ---------------- 修改指南（离线单机 modding 分析 + 结论笔记） ----------------
+const mg = { report: null, notes: '' };
+function openModguide() { $('mgOverlay').classList.remove('hidden'); loadModguide(); }
+function closeModguide() { $('mgOverlay').classList.add('hidden'); }
+async function loadModguide() {
+  try {
+    const d = await (await api('/api/modguide')).json();
+    mg.report = d.report; mg.notes = d.notes || '';
+    $('mgNotes').value = mg.notes;
+    renderModguide();
+  } catch (e) { $('mgBody').innerHTML = `<div class="mg-empty">加载失败：${esc(e.message)}</div>`; }
+}
+async function runModguideAnalysis() {
+  const btn = $('mgAnalyze'); btn.disabled = true;
+  $('mgProgress').textContent = '分析中…';
+  try {
+    const d = await (await postJson('/api/modguide/analyze', {})).json();
+    mg.report = d.report; mg.notes = d.notes || '';
+    $('mgNotes').value = mg.notes;
+    renderModguide();
+    $('mgProgress').textContent = '分析完成';
+  } catch (e) { $('mgProgress').textContent = ''; toast(e.message, true); }
+  finally { btn.disabled = false; setTimeout(() => { $('mgProgress').textContent = ''; }, 2500); }
+}
+function renderModguide() {
+  const r = mg.report;
+  $('mgGame').textContent = r ? (r.game || '') : '';
+  const body = $('mgBody');
+  if (!r) { body.innerHTML = '<div class="mg-empty">点「一键分析」识别当前游戏的货币 / 存档机制与可行改法，结果按项目保存供参考。</div>'; return; }
+  const badges = `<div class="mg-badges"><span class="mg-badge">${esc(r.platform || '')}</span><span class="mg-badge">${esc(r.engine || '')}</span><span class="mg-badge">${esc(r.backend || '')}</span>${r.unity_version ? `<span class="mg-badge">Unity ${esc(r.unity_version)}</span>` : ''}</div>`;
+  const steps = `<div class="mg-sec"><div class="mg-sec-t">分析步骤</div><ol class="mg-steps">${(r.steps || []).map(s => `<li>${esc(s)}</li>`).join('')}</ol></div>`;
+  const groups = r.currency || {};
+  const cur = Object.keys(groups).length ? `<div class="mg-sec"><div class="mg-sec-t">货币 / 经济关键词</div>`
+    + Object.entries(groups).map(([g, arr]) => `<div class="mg-grp"><span class="mg-grp-t">${esc(g)}</span><div class="mg-tags">${arr.map(x => `<code class="mg-tag">${esc(x)}</code>`).join('')}</div></div>`).join('')
+    + ((r.runtime_money || []).length ? `<div class="mg-grp"><span class="mg-grp-t">运行时货币信号</span><div class="mg-tags">${r.runtime_money.map(x => `<code class="mg-tag hot">${esc(x)}</code>`).join('')}</div></div>` : '')
+    + `</div>` : '';
+  const sv = r.save || {};
+  const save = `<div class="mg-sec"><div class="mg-sec-t">存档机制</div>`
+    + ((sv.frameworks || []).length ? `<div class="mg-grp"><span class="mg-grp-t">存档框架</span><div class="mg-tags">${sv.frameworks.map(x => `<span class="mg-tag fw">${esc(x)}</span>`).join('')}</div></div>` : '<div class="mg-na">未识别出明确存档框架</div>')
+    + (sv.path ? `<div class="mg-kv"><span>存档路径</span><code>${esc(sv.path)}</code><em class="${sv.exists ? 'ok' : 'no'}">${sv.exists ? '已存在' : '不存在 / 未运行过'}</em></div>` : '')
+    + ((sv.files || []).length ? `<div class="mg-kv"><span>存档文件</span><code>${esc(sv.files.join(', '))}</code></div>` : '')
+    + `</div>`;
+  const triggers = r.cheat_triggers || [];
+  const cheat = ((r.cheat_hints || []).length || triggers.length) ? `<div class="mg-sec"><div class="mg-sec-t">内置作弊 / 调试指令</div>`
+    + ((r.cheat_hints || []).length ? `<div class="mg-grp"><span class="mg-grp-t">关键词</span><div class="mg-tags">${r.cheat_hints.map(x => `<code class="mg-tag hot">${esc(x)}</code>`).join('')}</div></div>` : '')
+    + (triggers.length ? `<div class="mg-grp"><span class="mg-grp-t">触发方法</span>` + triggers.map(t => `<div class="mg-trigger"><div class="mg-trigger-head"><b>${esc(t.class)}</b><span class="mg-tag fw">${esc(t.mechanism)}</span></div><div class="mg-tags">${(t.methods || []).map(m => `<code class="mg-tag hot">${esc(m)}</code>`).join('')}</div><div class="mg-trigger-desc">${esc(t.description)}</div>${(t.hosts || []).map(h => `<div class="mg-kv"><span>挂载</span><code>${esc(h.scene)} / ${esc(h.gameobject)}</code><em class="${h.active ? 'ok' : 'no'}">${h.active ? '显示' : '隐藏'}</em></div>`).join('')}</div>`).join('') + `</div>` : '')
+    + `</div>` : '';
+  const fe = r.feasibility || {};
+  const feas = `<div class="mg-sec"><div class="mg-sec-t">可行改法评估</div><div class="mg-verdict">${esc(fe.verdict || '')}</div>`
+    + ((fe.recommend || []).length ? `<ul class="mg-rec">${fe.recommend.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : '')
+    + ((fe.limits || []).length ? `<div class="mg-limits">${fe.limits.map(x => `<span>⚠ ${esc(x)}</span>`).join('')}</div>` : '')
+    + `</div>`;
+  body.innerHTML = badges + steps + cur + save + cheat + feas;
+}
+async function saveModguideNotes() {
+  try {
+    await postJson('/api/modguide/notes', { notes: $('mgNotes').value });
+    mg.notes = $('mgNotes').value;
+    $('mgNotesStatus').textContent = '已保存';
+    setTimeout(() => { $('mgNotesStatus').textContent = ''; }, 2000);
+  } catch (e) { toast(e.message, true); }
+}
+$('btnModguide').onclick = openModguide;
+$('mgClose').onclick = closeModguide;
+$('mgAnalyze').onclick = runModguideAnalysis;
+$('mgSaveNotes').onclick = saveModguideNotes;
+
 // ---------------- 在线翻译（百度/有道，按需+缓存） ----------------
 const onlineTr = {};
 async function openTrSettings() {
@@ -1809,6 +1884,7 @@ async function syncWorkspace() {
       $('pathInput').value = sess.path;
       if (sess.engine_label) showEngineBadge(sess);
       $('btnScan').disabled = !sess.supported;
+      $('btnModguide').disabled = !sess.supported;
       setProject(sess.path);
     }
     const st = await (await api('/api/scan/status')).json();
